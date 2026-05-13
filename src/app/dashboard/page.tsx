@@ -151,7 +151,7 @@ function DashboardContent() {
       <div className="max-w-xl mx-auto flex flex-col gap-6">
 
         <div className="flex items-center justify-between">
-          <h1 className="text-xl font-bold text-olive-900">Apply for Job</h1>
+          <h1 className="text-xl font-bold text-olive-900">Text To Leads Extractor</h1>
           <button onClick={signOut} className="text-sm text-olive-500 hover:text-olive-800">Sign out</button>
         </div>
 
