@@ -47,8 +47,41 @@ jobs:
             quit
           "
 
-      - name: Restart Node.js App via cPanel API
+      - name: Set env vars + restart Node.js App via cPanel API
+        env:
+          H: ${{ secrets.CPANEL_HOST }}
+          U: ${{ secrets.CPANEL_USER }}
+          P: ${{ secrets.CPANEL_PASS }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
         run: |
-          curl -sk -u "${{ secrets.CPANEL_USER }}:${{ secrets.CPANEL_PASS }}" \
-            "https://${{ secrets.CPANEL_HOST }}:2083/execute/NodeJS/restart_app?app_name=tools.zulqurnainj.com" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d)"
+          python3 - << 'PYEOF'
+          import os, json, subprocess, urllib.parse
+
+          h = os.environ['H']; u = os.environ['U']; p = os.environ['P']
+          uapi = f"https://{h}:2083/execute"
+
+          def curl(url):
+              return subprocess.check_output(['curl','-sk','-u',f'{u}:{p}',url],text=True,timeout=20)
+
+          env_vars = {
+              "NEXT_PUBLIC_APP_URL": "https://tools.zulqurnainj.com",
+              "DB_HOST": "localhost",
+              "DB_USER": f"{u}_toolsu",
+              "DB_PASS": os.environ['DB_PASS'],
+              "DB_NAME": f"{u}_toolsdb",
+              "JWT_SECRET": os.environ['JWT_SECRET'],
+              "CV_STORAGE_PATH": f"/home/{u}/tool_cvs",
+              "LLAMA_API_KEY": os.environ['LLAMA_API_KEY'],
+              "NODE_ENV": "production",
+              "PORT": "3000",
+          }
+
+          envs_param = urllib.parse.quote(json.dumps(env_vars), safe='')
+          r = curl(f"{uapi}/NodeJS/update_app_env_var?app_name=tools.zulqurnainj.com&envvars={envs_param}")
+          print("Env update:", r[:200])
+
+          r = curl(f"{uapi}/NodeJS/restart_app?app_name=tools.zulqurnainj.com")
+          print("Restart:", r[:200])
+          PYEOF
