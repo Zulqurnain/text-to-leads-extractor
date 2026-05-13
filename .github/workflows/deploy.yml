@@ -48,50 +48,45 @@ jobs:
             [ -d "node_modules/$dep" ] && cp -r "node_modules/$dep" .next/standalone/node_modules/
           done
 
-          # Write .env file (read by startup.js at runtime — never in webroot)
+          # Write .env and startup.js
           python3 - << 'PYEOF'
           import os
           cpanel_user = os.environ['CPANEL_USER']
           lines = [
-            f'NEXT_PUBLIC_APP_URL=https://tools.zulqurnainj.com',
-            f'DB_HOST=localhost',
-            f'DB_USER={cpanel_user}_toolsu',
-            f'DB_PASS={os.environ["DB_PASS"]}',
-            f'DB_NAME={cpanel_user}_toolsdb',
-            f'JWT_SECRET={os.environ["JWT_SECRET"]}',
-            f'CV_STORAGE_PATH=/home/{cpanel_user}/tool_cvs',
-            # offLLama embedded mode when LLAMA_API_URL is empty
-            f'OFFL_LLAMA_MODEL_DIR=/home/{cpanel_user}/offllama_models',
+            'NEXT_PUBLIC_APP_URL=https://tools.zulqurnainj.com',
+            'DB_HOST=localhost',
+            'DB_USER=' + cpanel_user + '_toolsu',
+            'DB_PASS=' + os.environ['DB_PASS'],
+            'DB_NAME=' + cpanel_user + '_toolsdb',
+            'JWT_SECRET=' + os.environ['JWT_SECRET'],
+            'CV_STORAGE_PATH=/home/' + cpanel_user + '/tool_cvs',
+            'OFFL_LLAMA_MODEL_DIR=/home/' + cpanel_user + '/offllama_models',
           ]
-          # Only add LLAMA_API_URL if explicitly set (enables HTTP mode)
-          if os.environ.get("LLAMA_API_URL","").strip():
-            lines.append(f'LLAMA_API_URL={os.environ["LLAMA_API_URL"]}')
-          if os.environ.get("LLAMA_API_KEY","").strip():
-            lines.append(f'LLAMA_API_KEY={os.environ["LLAMA_API_KEY"]}')
-          lines += [
-            f'NODE_ENV=production',
-            f'PORT=3000',
-            f'HOSTNAME=0.0.0.0',
-          ]
+          if os.environ.get('LLAMA_API_URL', '').strip():
+            lines.append('LLAMA_API_URL=' + os.environ['LLAMA_API_URL'])
+          if os.environ.get('LLAMA_API_KEY', '').strip():
+            lines.append('LLAMA_API_KEY=' + os.environ['LLAMA_API_KEY'])
+          lines += ['NODE_ENV=production', 'PORT=3000', 'HOSTNAME=0.0.0.0']
           with open('.next/standalone/.env', 'w') as f:
             f.write('\n'.join(lines) + '\n')
           print('Wrote .env with', len(lines), 'vars')
+          startup = (
+            '"use strict";\n'
+            'const fs = require("fs");\n'
+            'const path = require("path");\n'
+            'const envFile = path.join(__dirname, ".env");\n'
+            'if (fs.existsSync(envFile)) {\n'
+            '  fs.readFileSync(envFile, "utf8").split("\\n").forEach(line => {\n'
+            '    const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);\n'
+            '    if (m && m[1] && !(m[1] in process.env)) process.env[m[1]] = m[2];\n'
+            '  });\n'
+            '}\n'
+            'require("./server.js");\n'
+          )
+          with open('.next/standalone/startup.js', 'w') as f:
+            f.write(startup)
+          print('Wrote startup.js')
           PYEOF
-
-          # Write startup.js — reads .env and starts server.js
-          cat > .next/standalone/startup.js << 'JSEOF'
-          'use strict';
-          const fs = require('fs');
-          const path = require('path');
-          const envFile = path.join(__dirname, '.env');
-          if (fs.existsSync(envFile)) {
-            fs.readFileSync(envFile, 'utf8').split('\n').forEach(line => {
-              const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-              if (m && m[1] && !(m[1] in process.env)) process.env[m[1]] = m[2];
-            });
-          }
-          require('./server.js');
-          JSEOF
 
           # Touch tmp/restart.txt — Passenger picks this up to restart the app
           mkdir -p .next/standalone/tmp
@@ -122,39 +117,112 @@ jobs:
             quit
           " 2>&1 | tail -50
 
-      - name: Update app startup file and restart via PassengerApps API
+      - name: Register/update Passenger app and provision SSL
         env:
           H: ${{ secrets.CPANEL_HOST }}
           U: ${{ secrets.CPANEL_USER }}
           P: ${{ secrets.CPANEL_PASS }}
         run: |
           python3 - << 'PYEOF'
-          import os, subprocess, json, urllib.parse
+          import os, subprocess, json, urllib.parse, time
 
-          h = os.environ['H']; u = os.environ['U']; p = os.environ['P']
+          h = os.environ['H']
+          u = os.environ['U']
+          p = os.environ['P']
           uapi = f"https://{h}:2083/execute"
+          domain = "tools.zulqurnainj.com"
+          app_name = "tools"
 
-          def curl(url):
-              return subprocess.check_output(['curl','-sk','-u',f'{u}:{p}',url],text=True,timeout=20)
+          def curl(url, timeout=30):
+              out = subprocess.check_output(
+                  ['curl', '-sk', '-u', f'{u}:{p}', url],
+                  text=True, timeout=timeout
+              )
+              print(f"  → {url.split('?')[0].split('/')[-2:]}: {out[:200]}")
+              return out
 
-          # Update app to ensure startup_file is correct
-          params = urllib.parse.urlencode({
-              "name": "tools",
-              "startup_file": "startup.js",
-              "app_type": "node",
-              "node_version": "22",
-              "deployment_mode": "production",
+          def uapi_ok(resp):
+              try:
+                  return json.loads(resp).get('status', 0) == 1
+              except Exception:
+                  return False
+
+          # ── 1. Register app (creates it if missing, harmless if it already exists) ──
+          print("\n── Registering Passenger app ──")
+          reg_params = urllib.parse.urlencode({
+              "name":             app_name,
+              "path":             f"/home/{u}/{domain}",
+              "domain":           domain,
+              "base_uri":         "/",
+              "startup_file":     "startup.js",
+              "app_type":         "node",
+              "node_version":     "22",
+              "deployment_mode":  "production",
           })
-          r = curl(f"{uapi}/PassengerApps/update_application?{params}")
-          print("Update app:", r[:300])
+          r_reg = curl(f"{uapi}/PassengerApps/register_application?{reg_params}")
+          if uapi_ok(r_reg):
+              print("  App registered OK")
+          else:
+              print("  Register returned non-OK (app may already exist — continuing)")
 
-          # Restart the app
-          r2 = curl(f"{uapi}/PassengerApps/ensure_application_has_started?name=tools")
-          print("Restart:", r2[:300])
+          # ── 2. Update to ensure correct settings ──
+          print("\n── Updating app settings ──")
+          upd_params = urllib.parse.urlencode({
+              "name":             app_name,
+              "startup_file":     "startup.js",
+              "app_type":         "node",
+              "node_version":     "22",
+              "deployment_mode":  "production",
+          })
+          r_upd = curl(f"{uapi}/PassengerApps/update_application?{upd_params}")
+          print("  Update:", "OK" if uapi_ok(r_upd) else "failed (non-fatal)")
 
-          r3 = curl(f"{uapi}/PassengerApps/disable_application?name=tools")
-          print("Disable:", r3[:200])
-          import time; time.sleep(2)
-          r4 = curl(f"{uapi}/PassengerApps/enable_application?name=tools")
-          print("Enable:", r4[:200])
+          # ── 3. Restart cycle ──
+          print("\n── Restarting app ──")
+          curl(f"{uapi}/PassengerApps/ensure_application_has_started?name={app_name}")
+          curl(f"{uapi}/PassengerApps/disable_application?name={app_name}")
+          time.sleep(3)
+          r_en = curl(f"{uapi}/PassengerApps/enable_application?name={app_name}")
+          print("  Enable:", "OK" if uapi_ok(r_en) else "failed")
+
+          # ── 4. Provision SSL (Let's Encrypt via AutoSSL) ──
+          print("\n── Provisioning SSL for", domain, "──")
+
+          # Try Let's Encrypt UAPI first (available on most Namecheap cPanel)
+          ssl_params = urllib.parse.urlencode({
+              "domains[0]": domain,
+              "keytype": "prime256v1",
+          })
+          r_ssl = curl(f"{uapi}/LetsEncrypt/issue?{ssl_params}", timeout=120)
+          if uapi_ok(r_ssl):
+              print("  Let's Encrypt cert issued OK")
+          else:
+              print("  LetsEncrypt/issue not available or failed — triggering AutoSSL")
+              # Trigger AutoSSL as fallback (runs in background on server)
+              r_auto = curl(f"{uapi}/SSL/start_autossl_check_cpanel_domains")
+              print("  AutoSSL check triggered:", r_auto[:150])
+
+          # ── 5. Verify app is reachable ──
+          print("\n── Verifying app ──")
+          time.sleep(5)
+          try:
+              check = subprocess.check_output(
+                  ['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
+                   f'https://{domain}/text-to-leads'],
+                  text=True, timeout=15
+              )
+              print(f"  https://{domain}/text-to-leads → HTTP {check}")
+              if check in ('200', '308', '307'):
+                  print("  ✓ App is live")
+              else:
+                  # Also try http
+                  check2 = subprocess.check_output(
+                      ['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
+                       f'http://{domain}/text-to-leads'],
+                      text=True, timeout=15
+                  )
+                  print(f"  http://{domain}/text-to-leads  → HTTP {check2}")
+          except Exception as e:
+              print("  Verify request failed:", e)
+
           PYEOF
