@@ -26,11 +26,25 @@ export async function POST(req: NextRequest) {
   const filename = `${user.id}.pdf`;
   const filepath = join(CV_DIR, filename);
   const bytes = await file.arrayBuffer();
-  await writeFile(filepath, Buffer.from(bytes));
+  const buffer = Buffer.from(bytes);
+  await writeFile(filepath, buffer);
+
+  // Extract text from PDF for AI-personalized emails
+  let cvSummary = "";
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pdfParse = (await import("pdf-parse")) as any;
+    const fn = pdfParse.default ?? pdfParse;
+    const parsed = await fn(buffer);
+    // Trim to first 2000 chars — enough context for email generation, avoids token overflow
+    cvSummary = parsed.text.replace(/\s+/g, " ").trim().slice(0, 2000);
+  } catch (err) {
+    console.error("PDF text extraction failed (non-fatal):", err);
+  }
 
   await query(
-    "UPDATE users SET cv_path = ? WHERE id = ?",
-    [filename, user.id]
+    "UPDATE users SET cv_path = ?, cv_summary = ? WHERE id = ?",
+    [filename, cvSummary, user.id]
   );
 
   return NextResponse.json({ ok: true });
