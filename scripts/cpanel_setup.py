@@ -40,36 +40,36 @@ r = curl(f"{uapi}/Mysql/set_privileges_on_database?user={db_user}&database={db_n
 results['privileges'] = json.loads(r)
 print(r[:200])
 
-# 4. List available Node.js versions
-print("\n=== Available Node.js versions ===")
-r_versions = curl(f"{uapi}/NodeJS/get_available_node_versions")
-print(r_versions[:500])
-try:
-    versions_data = json.loads(r_versions)
-    available = [v.get('version','?') for v in versions_data.get('data', [])]
-    print("Available versions:", available)
-    node_ver = "22" if "22" in str(available) else (available[-1] if available else "20")
-except Exception as e:
-    print("Could not parse versions:", e)
-    node_ver = "20"
+# 4. Probe alternative Node.js/Passenger APIs
+print("\n=== Probing Passenger/NodeJS app management APIs ===")
+probe_endpoints = [
+    "PassengerApps/list_apps",
+    "PassengerApps/register_application",
+    "NodeApp/list",
+    "LangApp/list",
+    "CloudLinux/get_nodejs_versions",
+    "Passenger/list_applications",
+]
+probe_results = {}
+for ep in probe_endpoints:
+    r_probe = curl(f"{uapi}/{ep}")
+    probe_results[ep] = r_probe[:200]
+    print(f"{ep}: {r_probe[:200]}")
 
-# 5. List existing apps (in case already created)
-print("\n=== Existing Node.js Apps ===")
-r_list = curl(f"{uapi}/NodeJS/list_applications")
-print(r_list[:500])
+# 5. Try CloudLinux Node.js Selector API (alternative)
+print("\n=== Trying CloudLinux Node.js Selector ===")
+r_cl = curl(f"https://{host}:2083/frontend/paper_lantern/softaculous/index.live.php?act=nodejs&display=true")
+print(r_cl[:300])
 
-# 6. Create Node.js App
-print(f"\n=== Creating Node.js App (node_version={node_ver}) ===")
-r = curl(
-    f"{uapi}/NodeJS/create_application"
-    f"?app_name=tools.zulqurnainj.com"
-    f"&app_root=tools.zulqurnainj.com"
-    f"&startup_file=server.js"
-    f"&node_version={node_ver}"
-    f"&app_env=production"
-)
-results['nodejs_create'] = json.loads(r)
-print("FULL RESPONSE:", r[:1000])
+# 6. Try LVE Manager / Selector API
+r_lve = curl(f"https://{host}:2083/cgi/lvemanager/index.cgi?mod=nodejs")
+print("LVE Manager:", r_lve[:300])
+
+results['nodejs_create'] = {'status': 0, 'note': 'NodeJS UAPI not available — manual setup required'}
+
+r_versions = probe_results.get("PassengerApps/list_apps", "N/A")
+r_list = probe_results.get("NodeApp/list", "N/A")
+r = str(probe_results)
 
 print("\n=== Setup complete ===")
 print(json.dumps(results, indent=2)[:800])
