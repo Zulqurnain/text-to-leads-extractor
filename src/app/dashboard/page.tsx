@@ -51,11 +51,12 @@ function DashboardContent() {
     fetch("/api/cv").then(r => {
       if (r.status === 401) { router.push("/auth/login"); return null; }
       return r.json();
-    }).then(d => { if (d?.hasCv) setHasCv(true); });
+    }).then(d => { if (d?.hasCv) setHasCv(true); }).catch(() => {});
 
-    fetch("/api/connections").then(r => r.json()).then(d => {
-      if (d?.connection) setConnection(d.connection);
-    });
+    fetch("/api/connections").then(r => {
+      if (r.status === 401) { router.push("/auth/login"); return null; }
+      return r.json();
+    }).then(d => { if (d?.connection) setConnection(d.connection); }).catch(() => {});
   }, [router]);
 
   function handlePresetChange(preset: string) {

@@ -42,6 +42,7 @@ jobs:
           mkdir -p .next/standalone/node_modules
           cp -r node_modules/offllama .next/standalone/node_modules/
           cp -r node_modules/node-llama-cpp .next/standalone/node_modules/
+          cp -r node_modules/pdf-parse .next/standalone/node_modules/
           # Copy offllama's runtime deps too
           for dep in lifecycle-utils; do
             [ -d "node_modules/$dep" ] && cp -r "node_modules/$dep" .next/standalone/node_modules/

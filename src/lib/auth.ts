@@ -64,7 +64,7 @@ export async function clearSessionCookie(): Promise<void> {
 
 export async function getUserById(id: number) {
   const rows = await query<RowDataPacket[]>(
-    "SELECT id, email, full_name, cv_path FROM users WHERE id = ?",
+    "SELECT id, email, full_name, cv_path, cv_summary FROM users WHERE id = ?",
     [id]
   );
   return rows[0] ?? null;

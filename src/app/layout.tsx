@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Apply for Job — AI-powered job application tool",
+  title: "Text To Leads Extractor — AI-powered outreach tool",
   description:
-    "Paste any job post. AI extracts recruiter emails, WhatsApp, and Telegram. Send your application with one click.",
+    "Paste any job post or recruiter message. AI extracts emails, WhatsApp, and Telegram contacts. Send personalised outreach in one click.",
 };
 
 export default function RootLayout({
