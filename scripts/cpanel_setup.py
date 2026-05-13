@@ -49,7 +49,7 @@ print("PassengerApps funcs:", r_funcs[:600])
 print("\n=== Trying PassengerApps/register_application ===")
 import urllib.parse
 app_params = urllib.parse.urlencode({
-    "name": "tools.zulqurnainj.com",
+    "name": "tools",
     "path": f"/home/{user}/tools.zulqurnainj.com",
     "domain": "tools.zulqurnainj.com",
     "base_uri": "/",
