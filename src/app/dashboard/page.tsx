@@ -42,6 +42,11 @@ function DashboardContent() {
   const [smtpPass, setSmtpPass] = useState("");
   const [smtpSaving, setSmtpSaving] = useState(false);
 
+  // Prefetch/warm up the AI model as soon as the page loads
+  useEffect(() => {
+    fetch("/api/warmup").catch(() => {});
+  }, []);
+
   useEffect(() => {
     fetch("/api/cv").then(r => {
       if (r.status === 401) { router.push("/auth/login"); return null; }
@@ -252,7 +257,11 @@ function DashboardContent() {
           <textarea value={text} onChange={(e) => setText(e.target.value)} rows={8}
             placeholder="Paste a LinkedIn post, job listing, or recruiter message here..."
             className="w-full px-3 py-2.5 rounded-xl border border-olive-200 bg-white text-olive-900 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-olive-400" />
-          <button onClick={handleExtract} disabled={loading || !text.trim()}
+          <button
+            onClick={handleExtract}
+            onMouseEnter={() => fetch("/api/warmup").catch(() => {})}
+            onFocus={() => fetch("/api/warmup").catch(() => {})}
+            disabled={loading || !text.trim()}
             className="self-end px-5 py-2.5 rounded-xl bg-olive-800 text-olive-100 font-semibold hover:opacity-80 transition-opacity disabled:opacity-40">
             {loading ? "Extracting…" : "Extract & Generate"}
           </button>
