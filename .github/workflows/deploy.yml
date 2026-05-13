@@ -27,8 +27,9 @@ jobs:
           CPANEL_USER: ${{ secrets.CPANEL_USER }}
           DB_PASS: ${{ secrets.DB_PASS }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
+          # LLAMA_API_URL is optional — if unset, offLLama runs embedded (model auto-downloads)
           LLAMA_API_URL: ${{ secrets.LLAMA_API_URL }}
+          LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
         run: |
           cp -r .next/static .next/standalone/.next/static
           cp -r public .next/standalone/public
@@ -45,8 +46,15 @@ jobs:
             f'DB_NAME={cpanel_user}_toolsdb',
             f'JWT_SECRET={os.environ["JWT_SECRET"]}',
             f'CV_STORAGE_PATH=/home/{cpanel_user}/tool_cvs',
-            f'LLAMA_API_URL={os.environ.get("LLAMA_API_URL","http://localhost:8080")}',
-            f'LLAMA_API_KEY={os.environ["LLAMA_API_KEY"]}',
+            # offLLama embedded mode when LLAMA_API_URL is empty
+            f'OFFL_LLAMA_MODEL_DIR=/home/{cpanel_user}/offllama_models',
+          ]
+          # Only add LLAMA_API_URL if explicitly set (enables HTTP mode)
+          if os.environ.get("LLAMA_API_URL","").strip():
+            lines.append(f'LLAMA_API_URL={os.environ["LLAMA_API_URL"]}')
+          if os.environ.get("LLAMA_API_KEY","").strip():
+            lines.append(f'LLAMA_API_KEY={os.environ["LLAMA_API_KEY"]}')
+          lines += [
             f'NODE_ENV=production',
             f'PORT=3000',
             f'HOSTNAME=0.0.0.0',

@@ -1,5 +1,13 @@
-const LLAMA_URL = process.env.LLAMA_API_URL!;
-const LLAMA_KEY = process.env.LLAMA_API_KEY!;
+/**
+ * LLM client for the apply-for-job tool.
+ *
+ * Mode A — offLLama embedded: no LLAMA_API_URL set.
+ *   Loads the model directly in this process via the offllama npm package.
+ *   Model auto-downloads to OFFL_LLAMA_MODEL_DIR on first use (~400MB, once).
+ *
+ * Mode B — HTTP (offLLama server or any OpenAI-compatible endpoint):
+ *   Set LLAMA_API_URL to the server URL (e.g. http://localhost:8080).
+ */
 
 export interface ExtractedInfo {
   emails: string[];
@@ -11,113 +19,111 @@ export interface ExtractedInfo {
   summary: string;
 }
 
+// ── Embedded offLLama singleton ───────────────────────────────────────────────
+let embeddedEngine: import("offllama").LlamaEngine | null = null;
+let engineLoading: Promise<import("offllama").LlamaEngine> | null = null;
+
+async function getEmbeddedEngine(): Promise<import("offllama").LlamaEngine> {
+  if (embeddedEngine) return embeddedEngine;
+  if (engineLoading) return engineLoading;
+
+  engineLoading = (async () => {
+    const { LlamaEngine } = await import("offllama");
+    const engine = new LlamaEngine({
+      modelPath: process.env.OFFL_LLAMA_MODEL_PATH,
+      contextSize: parseInt(process.env.OFFL_LLAMA_CONTEXT_SIZE ?? "2048", 10),
+    });
+    await engine.load(true); // auto-download if missing
+    embeddedEngine = engine;
+    return engine;
+  })();
+
+  return engineLoading;
+}
+
+// ── Core chat helper ──────────────────────────────────────────────────────────
+async function chat(messages: Array<{ role: "system" | "user" | "assistant"; content: string }>, opts?: { temperature?: number; maxTokens?: number }): Promise<string> {
+  const url = process.env.LLAMA_API_URL;
+
+  if (url) {
+    // Mode B: HTTP
+    const key = process.env.LLAMA_API_KEY;
+    const res = await fetch(`${url}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(key ? { Authorization: `Bearer ${key}` } : {}),
+      },
+      body: JSON.stringify({
+        model: "local",
+        messages,
+        temperature: opts?.temperature ?? 0.7,
+        max_tokens: opts?.maxTokens ?? 512,
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!res.ok) throw new Error(`LLM HTTP error: ${res.status}`);
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content ?? "";
+  }
+
+  // Mode A: embedded offLLama
+  const engine = await getEmbeddedEngine();
+  return engine.chat(messages, {
+    temperature: opts?.temperature ?? 0.7,
+    maxTokens: opts?.maxTokens ?? 512,
+  });
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
 export async function extractFromText(text: string): Promise<ExtractedInfo> {
-  const prompt = `Extract information from this job post or recruiter message. Return ONLY valid JSON with these fields:
-- emails: array of email addresses found
-- phones: array of phone numbers found (digits only, with country code)
-- telegram_usernames: array of Telegram usernames found (without @)
-- recruiter_name: name of the recruiter or hiring manager (empty string if not found)
-- company: company name (empty string if not found)
-- job_title: job title being advertised (empty string if not found)
-- summary: one sentence summary of the opportunity
+  const content = await chat([
+    {
+      role: "user",
+      content: `Extract information from this job post or recruiter message. Return ONLY valid JSON:
+{"emails":[],"phones":[],"telegram_usernames":[],"recruiter_name":"","company":"","job_title":"","summary":""}
 
 Text:
 ${text.slice(0, 3000)}
 
-JSON:`;
-
-  const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(LLAMA_KEY ? { Authorization: `Bearer ${LLAMA_KEY}` } : {}),
+JSON:`,
     },
-    body: JSON.stringify({
-      model: "local",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.1,
-      max_tokens: 512,
-    }),
-    signal: AbortSignal.timeout(30000),
-  });
+  ], { temperature: 0.1, maxTokens: 512 });
 
-  if (!res.ok) throw new Error(`llama.cpp error: ${res.status}`);
-
-  const data = await res.json();
-  const content = data.choices?.[0]?.message?.content ?? "{}";
-
-  const jsonMatch = content.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error("No JSON in llama response");
-
-  return JSON.parse(jsonMatch[0]) as ExtractedInfo;
+  const match = content.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("No JSON in LLM response");
+  return JSON.parse(match[0]) as ExtractedInfo;
 }
 
-export async function generateEmail(
-  info: ExtractedInfo,
-  cvSummary: string,
-  userName: string
-): Promise<string> {
-  const prompt = `Write a professional job application email. Be concise, friendly, and specific.
+export async function generateEmail(info: ExtractedInfo, cvSummary: string, userName: string): Promise<string> {
+  return chat([
+    {
+      role: "user",
+      content: `Write a professional job application email. Be concise and specific.
 
 Applicant: ${userName}
 CV summary: ${cvSummary.slice(0, 500)}
 Recruiter: ${info.recruiter_name || "Hiring Manager"}
 Company: ${info.company || "your company"}
 Role: ${info.job_title || "the advertised position"}
-Opportunity summary: ${info.summary}
+Opportunity: ${info.summary}
 
-Write ONLY the email body (no subject line). Start with a greeting. End with a professional sign-off.`;
-
-  const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(LLAMA_KEY ? { Authorization: `Bearer ${LLAMA_KEY}` } : {}),
+Write ONLY the email body (no subject line). Start with a greeting.`,
     },
-    body: JSON.stringify({
-      model: "local",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.7,
-      max_tokens: 600,
-    }),
-    signal: AbortSignal.timeout(30000),
-  });
-
-  if (!res.ok) throw new Error(`llama.cpp error: ${res.status}`);
-
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content ?? "";
+  ], { temperature: 0.7, maxTokens: 600 });
 }
 
-export async function generateWhatsAppMessage(
-  info: ExtractedInfo,
-  userName: string
-): Promise<string> {
-  const prompt = `Write a short WhatsApp message applying for a job. Max 3 sentences. Be professional but conversational.
+export async function generateWhatsAppMessage(info: ExtractedInfo, userName: string): Promise<string> {
+  return chat([
+    {
+      role: "user",
+      content: `Write a short WhatsApp job application message. Max 3 sentences. Professional but conversational.
 
 Applicant: ${userName}
 Company: ${info.company || "your company"}
 Role: ${info.job_title || "the advertised position"}
 
-Write ONLY the message text, no quotes.`;
-
-  const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(LLAMA_KEY ? { Authorization: `Bearer ${LLAMA_KEY}` } : {}),
+Write ONLY the message text.`,
     },
-    body: JSON.stringify({
-      model: "local",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.7,
-      max_tokens: 150,
-    }),
-    signal: AbortSignal.timeout(30000),
-  });
-
-  if (!res.ok) throw new Error(`llama.cpp error: ${res.status}`);
-
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content ?? "";
+  ], { temperature: 0.7, maxTokens: 150 });
 }
