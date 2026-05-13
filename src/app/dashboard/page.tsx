@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import type { ExtractedInfo } from "@/lib/llama";
-import { SMTP_PRESETS } from "@/lib/smtp";
+import { SMTP_PRESETS } from "@/lib/smtp-presets";
 
 type Connection = { label: string; smtp_user: string } | null;
 

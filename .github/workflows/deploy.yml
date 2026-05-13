@@ -1,0 +1,54 @@
+name: Deploy to cPanel
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (standalone)
+        run: npm run build
+
+      - name: Prepare deploy bundle
+        run: |
+          cp -r .next/static .next/standalone/.next/static
+          cp -r public .next/standalone/public
+
+      - name: Install lftp
+        run: sudo apt-get install -y lftp -q
+
+      - name: Upload to server via FTP
+        env:
+          FTP_USER: ${{ secrets.FTP_USERNAME }}
+          FTP_PASS: ${{ secrets.FTP_PASSWORD }}
+          FTP_HOST: ${{ secrets.FTP_SERVER }}
+        run: |
+          lftp -c "
+            set ftp:ssl-allow no;
+            set net:timeout 60;
+            set net:max-retries 5;
+            open -u \"$FTP_USER\",\"$FTP_PASS\" ftp://$FTP_HOST;
+            mirror --reverse --delete --verbose \
+              --exclude .git --exclude '.next/cache' \
+              .next/standalone/ tools.zulqurnainj.com/;
+            quit
+          "
+
+      - name: Restart Node.js App via cPanel API
+        run: |
+          curl -sk -u "${{ secrets.CPANEL_USER }}:${{ secrets.CPANEL_PASS }}" \
+            "https://${{ secrets.CPANEL_HOST }}:2083/execute/NodeJS/restart_app?app_name=tools.zulqurnainj.com" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d)"

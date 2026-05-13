@@ -1,0 +1,26 @@
+name: Setup Server (run once)
+
+on:
+  workflow_dispatch:
+    inputs:
+      db_pass:
+        description: 'MySQL password to set for the database user'
+        required: true
+
+permissions:
+  issues: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create MySQL DB + Node.js App on cPanel
+        env:
+          CPANEL_HOST: ${{ secrets.CPANEL_HOST }}
+          CPANEL_USER: ${{ secrets.CPANEL_USER }}
+          CPANEL_PASS: ${{ secrets.CPANEL_PASS }}
+          DB_PASS: ${{ inputs.db_pass }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/cpanel_setup.py
