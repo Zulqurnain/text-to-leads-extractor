@@ -1,12 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createServerSupabaseClient, createAdminClient } from "@/lib/supabase";
+import { getSession } from "@/lib/auth";
+import { query } from "@/lib/db";
 import { sendViaGmail, refreshGmailToken } from "@/lib/gmail";
 import { sendViaOutlook, refreshOutlookToken } from "@/lib/outlook";
+import { readFile } from "fs/promises";
+import { join } from "path";
+import type { RowDataPacket } from "mysql2";
+
+const CV_DIR = process.env.CV_STORAGE_PATH ?? join(process.cwd(), "cv_storage");
 
 export async function POST(req: NextRequest) {
-  const supabase = await createServerSupabaseClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const session = await getSession();
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const { to, subject, body: emailBody, attachCv } = await req.json() as {
     to: string;
@@ -19,13 +24,11 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Missing fields" }, { status: 400 });
   }
 
-  const admin = createAdminClient();
-  const { data: connection } = await admin
-    .from("email_connections")
-    .select("provider, access_token, refresh_token, email")
-    .eq("user_id", user.id)
-    .single();
-
+  const rows = await query<RowDataPacket[]>(
+    "SELECT provider, access_token, refresh_token, email FROM email_connections WHERE user_id = ?",
+    [session.id]
+  );
+  const connection = rows[0];
   if (!connection) {
     return NextResponse.json({ error: "No email account connected" }, { status: 400 });
   }
@@ -34,45 +37,45 @@ export async function POST(req: NextRequest) {
   let cvFilename: string | undefined;
 
   if (attachCv) {
-    const { data: profile } = await admin
-      .from("profiles")
-      .select("cv_path")
-      .eq("id", user.id)
-      .single();
-
-    if (profile?.cv_path) {
-      const { data: cvData } = await admin.storage
-        .from("cvs")
-        .download(profile.cv_path);
-      if (cvData) {
-        const buf = await cvData.arrayBuffer();
-        cvBase64 = Buffer.from(buf).toString("base64");
-        cvFilename = profile.cv_path.split("/").pop() ?? "cv.pdf";
-      }
+    const cvRows = await query<RowDataPacket[]>(
+      "SELECT cv_path FROM users WHERE id = ?",
+      [session.id]
+    );
+    const cvPath = cvRows[0]?.cv_path as string | null;
+    if (cvPath) {
+      try {
+        const buf = await readFile(join(CV_DIR, cvPath));
+        cvBase64 = buf.toString("base64");
+        cvFilename = "cv.pdf";
+      } catch { /* CV file missing, continue without */ }
     }
   }
 
   if (connection.provider === "gmail") {
-    let accessToken = connection.access_token;
+    let accessToken = connection.access_token as string;
     try {
-      const refreshed = await refreshGmailToken(connection.refresh_token);
+      const refreshed = await refreshGmailToken(connection.refresh_token as string);
       accessToken = refreshed.access_token;
-      await admin
-        .from("email_connections")
-        .update({ access_token: accessToken })
-        .eq("user_id", user.id);
+      await query(
+        "UPDATE email_connections SET access_token = ? WHERE user_id = ?",
+        [accessToken, session.id]
+      );
     } catch { /* use existing token */ }
 
-    await sendViaGmail(accessToken, connection.email, to, subject, emailBody, cvBase64, cvFilename);
+    await sendViaGmail(
+      accessToken,
+      connection.email as string,
+      to, subject, emailBody, cvBase64, cvFilename
+    );
   } else if (connection.provider === "outlook") {
-    let accessToken = connection.access_token;
+    let accessToken = connection.access_token as string;
     try {
-      const refreshed = await refreshOutlookToken(connection.refresh_token);
+      const refreshed = await refreshOutlookToken(connection.refresh_token as string);
       accessToken = refreshed.access_token;
-      await admin
-        .from("email_connections")
-        .update({ access_token: accessToken })
-        .eq("user_id", user.id);
+      await query(
+        "UPDATE email_connections SET access_token = ? WHERE user_id = ?",
+        [accessToken, session.id]
+      );
     } catch { /* use existing token */ }
 
     await sendViaOutlook(accessToken, to, subject, emailBody, cvBase64, cvFilename);

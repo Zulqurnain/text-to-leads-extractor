@@ -1,46 +1,24 @@
--- Run this in Supabase SQL Editor to set up the database
+-- Renamed: this is now a MySQL schema, not Supabase
+-- Run this in cPanel → phpMyAdmin on database your-cpanel-username_toolsdb
 
--- Profiles table (extends auth.users)
-create table if not exists public.profiles (
-  id uuid primary key references auth.users(id) on delete cascade,
-  full_name text,
-  cv_path text,
-  cv_summary text,
-  created_at timestamptz default now()
+CREATE TABLE IF NOT EXISTS users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  password_hash VARCHAR(255) NOT NULL,
+  full_name VARCHAR(255) NOT NULL,
+  cv_path VARCHAR(255) DEFAULT NULL,
+  cv_summary TEXT DEFAULT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-alter table public.profiles enable row level security;
-
-create policy "Users can read their own profile"
-  on public.profiles for select
-  using (auth.uid() = id);
-
-create policy "Users can update their own profile"
-  on public.profiles for insert
-  with check (auth.uid() = id);
-
-create policy "Users can update their own profile data"
-  on public.profiles for update
-  using (auth.uid() = id);
-
--- Email connections (Gmail, Outlook, Yahoo OAuth tokens)
-create table if not exists public.email_connections (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references auth.users(id) on delete cascade,
-  provider text not null check (provider in ('gmail', 'outlook', 'yahoo')),
-  email text not null,
-  access_token text not null,
-  refresh_token text,
-  created_at timestamptz default now(),
-  unique (user_id)
+CREATE TABLE IF NOT EXISTS email_connections (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  provider ENUM('gmail','outlook','yahoo') NOT NULL,
+  email VARCHAR(255) NOT NULL,
+  access_token TEXT NOT NULL,
+  refresh_token TEXT DEFAULT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY unique_user (user_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
-
-alter table public.email_connections enable row level security;
-
-create policy "Users can read their own connections"
-  on public.email_connections for select
-  using (auth.uid() = user_id);
-
--- CVs storage bucket (private)
--- Run this in Supabase dashboard → Storage → New bucket: cvs (private)
--- Or run: insert into storage.buckets (id, name, public) values ('cvs', 'cvs', false);

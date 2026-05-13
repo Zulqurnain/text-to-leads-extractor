@@ -1,38 +1,27 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createServerSupabaseClient } from "@/lib/supabase";
+import { getSession, getUserById } from "@/lib/auth";
 import { extractFromText, generateEmail, generateWhatsAppMessage } from "@/lib/llama";
-import { createAdminClient } from "@/lib/supabase";
 
 export async function POST(req: NextRequest) {
-  const supabase = await createServerSupabaseClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const session = await getSession();
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const body = await req.json();
-  const { text } = body as { text?: string };
+  const { text } = await req.json() as { text?: string };
   if (!text || text.trim().length < 10) {
     return NextResponse.json({ error: "Text too short" }, { status: 400 });
   }
 
+  const user = await getUserById(session.id);
+  const cvSummary = (user?.cv_summary as string) ?? "";
+
   const info = await extractFromText(text);
-
-  // Get user profile for personalised email generation
-  const admin = createAdminClient();
-  const { data: profile } = await admin
-    .from("profiles")
-    .select("full_name, cv_summary")
-    .eq("id", user.id)
-    .single();
-
-  const userName = profile?.full_name ?? user.email ?? "Applicant";
-  const cvSummary = profile?.cv_summary ?? "";
 
   const [emailBody, whatsappMessage] = await Promise.all([
     info.emails.length > 0 || info.recruiter_name
-      ? generateEmail(info, cvSummary, userName)
+      ? generateEmail(info, cvSummary, session.full_name)
       : Promise.resolve(""),
     info.phones.length > 0
-      ? generateWhatsAppMessage(info, userName)
+      ? generateWhatsAppMessage(info, session.full_name)
       : Promise.resolve(""),
   ]);
 
@@ -40,6 +29,6 @@ export async function POST(req: NextRequest) {
     extracted: info,
     emailBody,
     whatsappMessage,
-    subject: `Application for ${info.job_title || "the advertised position"} — ${userName}`,
+    subject: `Application for ${info.job_title || "the advertised position"} — ${session.full_name}`,
   });
 }
