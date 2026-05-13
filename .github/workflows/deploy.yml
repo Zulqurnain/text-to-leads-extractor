@@ -138,7 +138,7 @@ jobs:
                   ['curl', '-sk', '-u', f'{u}:{p}', url],
                   text=True, timeout=timeout
               )
-              print(f"  → {url.split('?')[0].split('/')[-2:]}: {out[:200]}")
+              print(f"  → {url.split('?')[0].split('/')[-2:]}: {out[:300]}")
               return out
 
           def uapi_ok(resp):
@@ -146,6 +146,21 @@ jobs:
                   return json.loads(resp).get('status', 0) == 1
               except Exception:
                   return False
+
+          # ── 0. Create subdomain (idempotent — cPanel ignores if it already exists) ──
+          print("\n── Creating subdomain tools.zulqurnainj.com ──")
+          sub_params = urllib.parse.urlencode({
+              "domain":      "tools",
+              "rootdomain":  "zulqurnainj.com",
+              "dir":         f"tools.zulqurnainj.com",
+              "disallowdot": "0",
+          })
+          r_sub = curl(f"{uapi}/SubDomain/addsubdomain?{sub_params}")
+          if uapi_ok(r_sub):
+              print("  Subdomain created — waiting 5s for vhost propagation")
+              time.sleep(5)
+          else:
+              print("  Subdomain already exists or non-fatal error — continuing")
 
           # ── 1. Register app (creates it if missing, harmless if it already exists) ──
           print("\n── Registering Passenger app ──")
@@ -185,44 +200,37 @@ jobs:
           r_en = curl(f"{uapi}/PassengerApps/enable_application?name={app_name}")
           print("  Enable:", "OK" if uapi_ok(r_en) else "failed")
 
-          # ── 4. Provision SSL (Let's Encrypt via AutoSSL) ──
+          # ── 4. Provision SSL ──
+          # Try Let's Encrypt UAPI first, fall back to AutoSSL trigger
           print("\n── Provisioning SSL for", domain, "──")
-
-          # Try Let's Encrypt UAPI first (available on most Namecheap cPanel)
           ssl_params = urllib.parse.urlencode({
               "domains[0]": domain,
-              "keytype": "prime256v1",
+              "keytype":    "prime256v1",
           })
           r_ssl = curl(f"{uapi}/LetsEncrypt/issue?{ssl_params}", timeout=120)
           if uapi_ok(r_ssl):
               print("  Let's Encrypt cert issued OK")
           else:
-              print("  LetsEncrypt/issue not available or failed — triggering AutoSSL")
-              # Trigger AutoSSL as fallback (runs in background on server)
+              print("  LetsEncrypt/issue unavailable or failed — triggering AutoSSL")
               r_auto = curl(f"{uapi}/SSL/start_autossl_check_cpanel_domains")
-              print("  AutoSSL check triggered:", r_auto[:150])
+              print("  AutoSSL triggered:", r_auto[:200])
 
           # ── 5. Verify app is reachable ──
           print("\n── Verifying app ──")
-          time.sleep(5)
-          try:
-              check = subprocess.check_output(
-                  ['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
-                   f'https://{domain}/text-to-leads'],
-                  text=True, timeout=15
-              )
-              print(f"  https://{domain}/text-to-leads → HTTP {check}")
-              if check in ('200', '308', '307'):
-                  print("  ✓ App is live")
-              else:
-                  # Also try http
-                  check2 = subprocess.check_output(
+          time.sleep(8)
+          for scheme in ("https", "http"):
+              try:
+                  code = subprocess.check_output(
                       ['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
-                       f'http://{domain}/text-to-leads'],
-                      text=True, timeout=15
+                       '--max-time', '15',
+                       f'{scheme}://{domain}/text-to-leads'],
+                      text=True, timeout=20
                   )
-                  print(f"  http://{domain}/text-to-leads  → HTTP {check2}")
-          except Exception as e:
-              print("  Verify request failed:", e)
+                  print(f"  {scheme}://{domain}/text-to-leads → HTTP {code}")
+                  if code in ('200', '307', '308'):
+                      print(f"  ✓ App is live over {scheme}")
+                      break
+              except Exception as e:
+                  print(f"  {scheme} check failed: {e}")
 
           PYEOF
