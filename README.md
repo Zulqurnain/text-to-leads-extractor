@@ -1,94 +1,129 @@
-# Apply for Job Tool
+# Text To Leads Extractor
 
-AI-powered job application tool at `tools.zulqurnainj.com`.
+AI-powered outreach tool. Paste any job post or recruiter message — AI extracts contacts (email, WhatsApp, Telegram) and writes a personalised outreach email with your CV attached. Send in one click.
 
-Paste any job post or recruiter message → AI extracts emails, WhatsApp numbers, Telegram handles → generates personalised application email with CV → send in one click.
+**Live at:** [tools.zulqurnainj.com/text-to-leads](https://tools.zulqurnainj.com/text-to-leads)
 
-**No Vercel. No Supabase. Runs entirely on your existing Namecheap cPanel hosting.**
+---
 
-## Stack
+## Features
+
+- **AI extraction** — pull emails, phone numbers, Telegram usernames from any pasted text
+- **Personalised email drafts** — AI reads your uploaded CV and tailors the email to the role
+- **One-click send** — connects to Gmail, Outlook, Yahoo, or any SMTP server via app passwords
+- **WhatsApp & Telegram links** — pre-filled message links open in one click
+- **CV upload** — upload once, text extracted and attached to every outreach automatically
+- **Rate limiting** — 20 requests/minute per IP
+- **Self-hosted AI** — powered by [offLLama](https://github.com/Zulqurnain/offllama), runs on cPanel without a VPS
+
+---
+
+## Tech Stack
 
 | Layer | Choice |
 |-------|--------|
-| Hosting | Namecheap cPanel Node.js App (Passenger) |
-| Database | MySQL (included in cPanel) |
-| Auth | bcryptjs + JWT (no third-party) |
-| CV storage | Server filesystem |
-| AI | Self-hosted llama.cpp |
-| Email send | Gmail OAuth + Microsoft Graph OAuth |
-| Rate limiting | In-memory (no Redis) |
+| Framework | Next.js 15 (App Router, standalone output) |
+| Auth | JWT via `jose` + bcrypt, HTTP-only cookies |
+| Database | MySQL (cPanel built-in) |
+| AI | offLLama embedded (node-llama-cpp, Qwen2.5-0.5B) |
+| Email | nodemailer + SMTP app passwords |
+| CV parsing | pdf-parse (text extraction for AI context) |
+| Styling | Tailwind CSS v4, olive palette |
+| Hosting | cPanel shared hosting via Passenger (Node.js) |
+| Deploy | GitHub Actions → FTP → PassengerApps API |
 
-## Setup
+---
 
-### 1. MySQL database
+## Project Structure
 
-In cPanel → MySQL Databases:
-1. Create database: `your-cpanel-username_toolsdb`
-2. Create user: `your-cpanel-username_toolsuser` with a strong password
-3. Add user to database with ALL privileges
-4. Open phpMyAdmin → select the database → SQL tab → paste and run `supabase/schema.sql`
-
-### 2. Node.js App in cPanel
-
-In cPanel → Setup Node.js App:
-1. Node.js version: **22** (or latest available)
-2. Application mode: **Production**
-3. Application root: `tools.zulqurnainj.com` (or wherever you upload the code)
-4. Application URL: `tools.zulqurnainj.com`
-5. Application startup file: `.next/standalone/server.js`
-6. Click **Create**
-7. Then add environment variables (see `.env.example`)
-
-### 3. Google OAuth (Gmail)
-
-1. console.cloud.google.com → new project → APIs & Services → Credentials
-2. Create OAuth 2.0 Client ID (Web application)
-3. Add authorized redirect URI: `https://tools.zulqurnainj.com/api/auth/gmail/callback`
-4. Enable Gmail API
-5. Add `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` to Node.js App env vars
-
-### 4. Microsoft OAuth (Outlook)
-
-1. portal.azure.com → App registrations → New registration
-2. Add redirect URI: `https://tools.zulqurnainj.com/api/auth/outlook/callback`
-3. Add API permission: `Mail.Send`, `User.Read`, `offline_access`
-4. Create a client secret
-5. Add `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET`, `MICROSOFT_TENANT_ID=common` to env vars
-
-### 5. llama.cpp (self-hosted AI)
-
-```bash
-# On any VPS (Oracle Cloud free tier works — 4 OCPU, 24GB RAM)
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp && cmake -B build && cmake --build build -j4
-# Download Qwen2.5-1.5B-Instruct-Q4_K_M.gguf (~1GB)
-./build/bin/llama-server -m model.gguf --port 8080 --host 0.0.0.0 --api-key YOUR_SECRET_KEY
+```
+src/
+  app/
+    text-to-leads/page.tsx   ← Landing page (tools.zulqurnainj.com/text-to-leads)
+    dashboard/page.tsx       ← Main tool UI
+    auth/login/page.tsx
+    auth/signup/page.tsx
+    api/
+      auth/{login,signup,logout}/  ← JWT auth
+      cv/                    ← Upload PDF, extract text for AI context
+      connections/           ← Save SMTP credentials
+      extract/               ← AI extraction + email/message generation
+      send-email/            ← Send via SMTP with CV attachment
+      warmup/                ← Pre-warm AI model on page load
+  lib/
+    auth.ts                  ← JWT, bcrypt, session cookies
+    db.ts                    ← MySQL pool
+    llama.ts                 ← LLM client (embedded offLLama or HTTP)
+    migrate.ts               ← Idempotent DB schema (runs on server start)
+    smtp.ts                  ← Nodemailer wrapper
+    smtp-presets.ts          ← Gmail, Outlook, Yahoo SMTP presets
+  instrumentation.ts         ← Startup: run migrations, create CV dir, warm AI
+  middleware.ts              ← Rate limiting (20 req/min/IP, in-memory)
 ```
 
-Set `LLAMA_API_URL=http://your-vps-ip:8080` and `LLAMA_API_KEY=YOUR_SECRET_KEY`.
+---
 
-### 6. Deploy to cPanel
+## Deployment
 
-```bash
-npm run build
-# Then upload .next/standalone/ to the server via SFTP:
-# sftp -P YOUR_SFTP_PORT your-cpanel-username@your-hosting-server.com
-# put -r .next/standalone/ /home/your-cpanel-username/tools.zulqurnainj.com/
+Deploys automatically to cPanel via GitHub Actions on every push to `master`.
+
+**Pipeline:**
+1. `npm ci --ignore-scripts` — skip postinstall scripts
+2. Download `node-llama-cpp` pre-built linux-x64 binaries separately
+3. `npm run build` — Next.js standalone build
+4. Copy `offllama`, `node-llama-cpp`, `pdf-parse` into standalone `node_modules`
+5. Generate `.env` file from secrets (written to app root, never in webroot)
+6. Upload via `lftp` FTP to cPanel
+7. Restart app via `PassengerApps` UAPI
+
+### Required GitHub Secrets
+
+| Secret | Description |
+|--------|-------------|
+| `CPANEL_USER` | cPanel username |
+| `CPANEL_PASS` | cPanel password |
+| `CPANEL_HOST` | cPanel hostname |
+| `DB_PASS` | MySQL database password |
+| `JWT_SECRET` | Random 32+ char string for signing JWTs |
+| `FTP_SERVER` | FTP hostname |
+| `FTP_USERNAME` | FTP username |
+| `FTP_PASSWORD` | FTP password |
+
+---
+
+## Environment Variables
+
+Auto-generated by the deploy workflow. For local dev, create `.env.local`:
+
+```env
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+DB_HOST=localhost
+DB_USER=root
+DB_PASS=your_password
+DB_NAME=text_to_leads
+JWT_SECRET=some-random-32-char-string
+CV_STORAGE_PATH=./cv_storage
+OFFL_LLAMA_MODEL_DIR=./offllama_models
+# Optional: use external OpenAI-compatible server instead of embedded model
+# LLAMA_API_URL=http://localhost:8080
+# LLAMA_API_KEY=optional-key
 ```
 
-Create the CV storage directory on the server:
-```bash
-mkdir -p /home/your-cpanel-username/tool_cvs
-chmod 700 /home/your-cpanel-username/tool_cvs
-```
+---
 
-Then in cPanel Node.js App, click **Restart**.
-
-## Local development
+## Local Development
 
 ```bash
-cp .env.example .env.local
-# Fill in values (use localhost MySQL for local dev)
+git clone https://github.com/Zulqurnain/text-to-leads-extractor
+cd text-to-leads-extractor
 npm install
+cp .env.example .env.local   # fill in DB credentials
 npm run dev
+# open http://localhost:3000/text-to-leads
 ```
+
+---
+
+## License
+
+Private — all rights reserved. Built by [Zulqurnain Haider](https://zulqurnainj.com).
