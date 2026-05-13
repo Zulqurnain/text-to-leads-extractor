@@ -75,6 +75,18 @@ async function chat(messages: Array<{ role: "system" | "user" | "assistant"; con
   });
 }
 
+/** Pre-warm the embedded model so the first user request is fast. */
+export async function warmupModel(): Promise<void> {
+  if (process.env.LLAMA_API_URL) return; // HTTP mode — nothing to warm
+  try {
+    console.log("offLLama: pre-loading model in background...");
+    await getEmbeddedEngine();
+    console.log("offLLama: model warm and ready");
+  } catch (err) {
+    console.error("offLLama warmup failed (non-fatal):", err);
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 export async function extractFromText(text: string): Promise<ExtractedInfo> {
   const content = await chat([
