@@ -34,6 +34,16 @@ jobs:
           cp -r .next/static .next/standalone/.next/static
           cp -r public .next/standalone/public
 
+          # Copy server-external packages into standalone so they're available at runtime.
+          # node-llama-cpp uses native binaries — must be for the target OS (linux-x64 = same as runner).
+          mkdir -p .next/standalone/node_modules
+          cp -r node_modules/offllama .next/standalone/node_modules/
+          cp -r node_modules/node-llama-cpp .next/standalone/node_modules/
+          # Copy offllama's runtime deps too
+          for dep in lifecycle-utils; do
+            [ -d "node_modules/$dep" ] && cp -r "node_modules/$dep" .next/standalone/node_modules/
+          done
+
           # Write .env file (read by startup.js at runtime — never in webroot)
           python3 - << 'PYEOF'
           import os
