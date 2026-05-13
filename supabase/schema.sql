@@ -1,5 +1,4 @@
--- Renamed: this is now a MySQL schema, not Supabase
--- Run this in cPanel → phpMyAdmin on database your-cpanel-username_toolsdb
+-- MySQL schema — run in cPanel → phpMyAdmin on database your-cpanel-username_toolsdb
 
 CREATE TABLE IF NOT EXISTS users (
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -14,10 +13,11 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS email_connections (
   id INT AUTO_INCREMENT PRIMARY KEY,
   user_id INT NOT NULL,
-  provider ENUM('gmail','outlook','yahoo') NOT NULL,
-  email VARCHAR(255) NOT NULL,
-  access_token TEXT NOT NULL,
-  refresh_token TEXT DEFAULT NULL,
+  label VARCHAR(100) NOT NULL,
+  smtp_host VARCHAR(255) NOT NULL,
+  smtp_port SMALLINT NOT NULL DEFAULT 587,
+  smtp_user VARCHAR(255) NOT NULL,
+  smtp_pass VARCHAR(255) NOT NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE KEY unique_user (user_id),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
