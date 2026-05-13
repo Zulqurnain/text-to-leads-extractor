@@ -46,7 +46,6 @@ r = curl(
     f"{uapi}/NodeJS/create_application"
     f"?app_name=tools.zulqurnainj.com"
     f"&app_root=tools.zulqurnainj.com"
-    f"&app_type=node"
     f"&startup_file=server.js"
     f"&node_version=22"
     f"&app_env=production"
