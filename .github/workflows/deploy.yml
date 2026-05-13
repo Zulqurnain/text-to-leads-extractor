@@ -105,16 +105,21 @@ jobs:
           FTP_PASS: ${{ secrets.FTP_PASSWORD }}
           FTP_HOST: ${{ secrets.FTP_SERVER }}
         run: |
-          lftp -c "
-            set ftp:ssl-allow no;
-            set net:timeout 60;
+          lftp -d -c "
+            set ftp:ssl-allow yes;
+            set ftp:ssl-force no;
+            set ssl:verify-certificate no;
+            set ftp:passive-mode yes;
+            set net:timeout 120;
             set net:max-retries 5;
+            set net:reconnect-interval-base 5;
+            set xfer:timeout 300;
             open -u \"$FTP_USER\",\"$FTP_PASS\" ftp://$FTP_HOST;
             mirror --reverse --delete --verbose \
-              --exclude .git --exclude '.next/cache' \
+              --exclude .git/ --exclude '.next/cache/' \
               .next/standalone/ tools.zulqurnainj.com/;
             quit
-          "
+          " 2>&1 | tail -50
 
       - name: Update app startup file and restart via PassengerApps API
         env:
