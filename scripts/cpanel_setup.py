@@ -40,36 +40,32 @@ r = curl(f"{uapi}/Mysql/set_privileges_on_database?user={db_user}&database={db_n
 results['privileges'] = json.loads(r)
 print(r[:200])
 
-# 4. Probe alternative Node.js/Passenger APIs
-print("\n=== Probing Passenger/NodeJS app management APIs ===")
-probe_endpoints = [
-    "PassengerApps/list_apps",
-    "PassengerApps/register_application",
-    "NodeApp/list",
-    "LangApp/list",
-    "CloudLinux/get_nodejs_versions",
-    "Passenger/list_applications",
-]
-probe_results = {}
-for ep in probe_endpoints:
-    r_probe = curl(f"{uapi}/{ep}")
-    probe_results[ep] = r_probe[:200]
-    print(f"{ep}: {r_probe[:200]}")
+# 4. List PassengerApps functions
+print("\n=== PassengerApps module functions ===")
+r_funcs = curl(f"https://{host}:2083/json-api/cpanel?cpanel_jsonapi_module=PassengerApps&cpanel_jsonapi_func=listfuncs&cpanel_jsonapi_apiversion=2")
+print("PassengerApps funcs:", r_funcs[:600])
 
-# 5. Try CloudLinux Node.js Selector API (alternative)
-print("\n=== Trying CloudLinux Node.js Selector ===")
-r_cl = curl(f"https://{host}:2083/frontend/paper_lantern/softaculous/index.live.php?act=nodejs&display=true")
-print(r_cl[:300])
+# 5. Try PassengerApps/register_application with correct params
+print("\n=== Trying PassengerApps/register_application ===")
+import urllib.parse
+app_params = urllib.parse.urlencode({
+    "name": "tools.zulqurnainj.com",
+    "path": f"/home/{user}/tools.zulqurnainj.com",
+    "domain": "tools.zulqurnainj.com",
+    "base_uri": "/",
+    "app_type": "node",
+    "startup_file": "startup.js",
+    "node_version": "22",
+})
+r = curl(f"{uapi}/PassengerApps/register_application?{app_params}")
+print("register_application:", r[:500])
+try:
+    results['nodejs_create'] = json.loads(r)
+except:
+    results['nodejs_create'] = {'status': 0, 'raw': r[:200]}
 
-# 6. Try LVE Manager / Selector API
-r_lve = curl(f"https://{host}:2083/cgi/lvemanager/index.cgi?mod=nodejs")
-print("LVE Manager:", r_lve[:300])
-
-results['nodejs_create'] = {'status': 0, 'note': 'NodeJS UAPI not available — manual setup required'}
-
-r_versions = probe_results.get("PassengerApps/list_apps", "N/A")
-r_list = probe_results.get("NodeApp/list", "N/A")
-r = str(probe_results)
+r_versions = r_funcs[:300]
+r_list = ""
 
 print("\n=== Setup complete ===")
 print(json.dumps(results, indent=2)[:800])
