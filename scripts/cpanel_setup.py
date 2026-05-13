@@ -79,18 +79,23 @@ if token and repo:
 
 **MySQL database:** `{db_name}`
 **MySQL user:** `{db_user}`
-**DB password:** Set in env var `DB_PASS` during workflow run
 
 **DB create:** `{results.get('db_create', {}).get('status', '?')}`
 **User create:** `{results.get('user_create', {}).get('status', '?')}`
 **Privileges:** `{results.get('privileges', {}).get('status', '?')}`
 **Node.js App:** `{results.get('nodejs_create', {}).get('status', '?')}`
 
+### Debug — Node.js API responses
+
+**Available versions raw:** `{r_versions[:300]}`
+
+**Existing apps raw:** `{r_list[:300]}`
+
+**Create app raw:** `{r[:500]}`
+
 ### Next steps
-1. Set all env vars in cPanel Node.js App panel (see `.env.example`)
-2. Set `DB_PASS={db_pass}` (or change it) in the Node.js App env vars
-3. Run the DB migration: copy `schema.sql` content into phpMyAdmin on `{db_name}`
-4. Push to master to trigger the deploy workflow
+1. Run the DB migration: paste `supabase/schema.sql` into phpMyAdmin on `{db_name}`
+2. Push to master to trigger the deploy workflow
 """
     payload = json.dumps({'title': '[setup] cPanel server setup complete', 'body': body}).encode()
     req = urllib.request.Request(
