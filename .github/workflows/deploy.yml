@@ -23,9 +23,57 @@ jobs:
         run: npm run build
 
       - name: Prepare deploy bundle
+        env:
+          CPANEL_USER: ${{ secrets.CPANEL_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
+          LLAMA_API_URL: ${{ secrets.LLAMA_API_URL }}
         run: |
           cp -r .next/static .next/standalone/.next/static
           cp -r public .next/standalone/public
+
+          # Write .env file (read by startup.js at runtime — never in webroot)
+          python3 - << 'PYEOF'
+          import os
+          cpanel_user = os.environ['CPANEL_USER']
+          lines = [
+            f'NEXT_PUBLIC_APP_URL=https://tools.zulqurnainj.com',
+            f'DB_HOST=localhost',
+            f'DB_USER={cpanel_user}_toolsu',
+            f'DB_PASS={os.environ["DB_PASS"]}',
+            f'DB_NAME={cpanel_user}_toolsdb',
+            f'JWT_SECRET={os.environ["JWT_SECRET"]}',
+            f'CV_STORAGE_PATH=/home/{cpanel_user}/tool_cvs',
+            f'LLAMA_API_URL={os.environ.get("LLAMA_API_URL","http://localhost:8080")}',
+            f'LLAMA_API_KEY={os.environ["LLAMA_API_KEY"]}',
+            f'NODE_ENV=production',
+            f'PORT=3000',
+            f'HOSTNAME=0.0.0.0',
+          ]
+          with open('.next/standalone/.env', 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+          print('Wrote .env with', len(lines), 'vars')
+          PYEOF
+
+          # Write startup.js — reads .env and starts server.js
+          cat > .next/standalone/startup.js << 'JSEOF'
+          'use strict';
+          const fs = require('fs');
+          const path = require('path');
+          const envFile = path.join(__dirname, '.env');
+          if (fs.existsSync(envFile)) {
+            fs.readFileSync(envFile, 'utf8').split('\n').forEach(line => {
+              const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+              if (m && m[1] && !(m[1] in process.env)) process.env[m[1]] = m[2];
+            });
+          }
+          require('./server.js');
+          JSEOF
+
+          # Touch tmp/restart.txt — Passenger picks this up to restart the app
+          mkdir -p .next/standalone/tmp
+          date > .next/standalone/tmp/restart.txt
 
       - name: Install lftp
         run: sudo apt-get install -y lftp -q
@@ -47,17 +95,14 @@ jobs:
             quit
           "
 
-      - name: Set env vars + restart Node.js App via cPanel API
+      - name: Update app startup file and restart via PassengerApps API
         env:
           H: ${{ secrets.CPANEL_HOST }}
           U: ${{ secrets.CPANEL_USER }}
           P: ${{ secrets.CPANEL_PASS }}
-          DB_PASS: ${{ secrets.DB_PASS }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
         run: |
           python3 - << 'PYEOF'
-          import os, json, subprocess, urllib.parse
+          import os, subprocess, json, urllib.parse
 
           h = os.environ['H']; u = os.environ['U']; p = os.environ['P']
           uapi = f"https://{h}:2083/execute"
@@ -65,23 +110,24 @@ jobs:
           def curl(url):
               return subprocess.check_output(['curl','-sk','-u',f'{u}:{p}',url],text=True,timeout=20)
 
-          env_vars = {
-              "NEXT_PUBLIC_APP_URL": "https://tools.zulqurnainj.com",
-              "DB_HOST": "localhost",
-              "DB_USER": f"{u}_toolsu",
-              "DB_PASS": os.environ['DB_PASS'],
-              "DB_NAME": f"{u}_toolsdb",
-              "JWT_SECRET": os.environ['JWT_SECRET'],
-              "CV_STORAGE_PATH": f"/home/{u}/tool_cvs",
-              "LLAMA_API_KEY": os.environ['LLAMA_API_KEY'],
-              "NODE_ENV": "production",
-              "PORT": "3000",
-          }
+          # Update app to ensure startup_file is correct
+          params = urllib.parse.urlencode({
+              "name": "tools",
+              "startup_file": "startup.js",
+              "app_type": "node",
+              "node_version": "22",
+              "deployment_mode": "production",
+          })
+          r = curl(f"{uapi}/PassengerApps/update_application?{params}")
+          print("Update app:", r[:300])
 
-          envs_param = urllib.parse.quote(json.dumps(env_vars), safe='')
-          r = curl(f"{uapi}/NodeJS/update_app_env_var?app_name=tools.zulqurnainj.com&envvars={envs_param}")
-          print("Env update:", r[:200])
+          # Restart the app
+          r2 = curl(f"{uapi}/PassengerApps/ensure_application_has_started?name=tools")
+          print("Restart:", r2[:300])
 
-          r = curl(f"{uapi}/NodeJS/restart_app?app_name=tools.zulqurnainj.com")
-          print("Restart:", r[:200])
+          r3 = curl(f"{uapi}/PassengerApps/disable_application?name=tools")
+          print("Disable:", r3[:200])
+          import time; time.sleep(2)
+          r4 = curl(f"{uapi}/PassengerApps/enable_application?name=tools")
+          print("Enable:", r4[:200])
           PYEOF

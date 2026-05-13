@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-time server setup: create MySQL DB + user, create cPanel Node.js App."""
+"""One-time server setup: create MySQL DB + user, create/register cPanel Passenger app."""
 import os, json, subprocess, urllib.parse, urllib.request
 
 host  = os.environ['CPANEL_HOST']
@@ -8,12 +8,10 @@ pw    = os.environ['CPANEL_PASS']
 token = os.environ.get('GH_TOKEN', '')
 repo  = os.environ.get('GH_REPO', '')
 
-base    = f"https://{host}:2083/json-api/cpanel"
 uapi    = f"https://{host}:2083/execute"
 db_name = f"{user}_toolsdb"
 db_user = f"{user}_toolsu"
 db_pass = os.environ.get('DB_PASS', 'ChangeMe_strong_pass_123')
-app_dir = f"tools.{host.replace('your-hosting-server.com', 'zulqurnainj.com')}"
 
 def curl(url):
     return subprocess.check_output(
@@ -22,76 +20,72 @@ def curl(url):
 
 results = {}
 
-# 1. Create MySQL database
+# 1. Create MySQL database (ok if already exists)
 print("=== Creating MySQL database ===")
 r = curl(f"{uapi}/Mysql/create_database?name={db_name}")
-results['db_create'] = json.loads(r)
+results['db_create'] = json.loads(r).get('status', 0)
 print(r[:200])
 
-# 2. Create MySQL user
+# 2. Create MySQL user (ok if already exists)
 print("\n=== Creating MySQL user ===")
 r = curl(f"{uapi}/Mysql/create_user?name={db_user}&password={urllib.parse.quote(db_pass, safe='')}")
-results['user_create'] = json.loads(r)
+results['user_create'] = json.loads(r).get('status', 0)
 print(r[:200])
 
 # 3. Grant all privileges
 print("\n=== Granting privileges ===")
 r = curl(f"{uapi}/Mysql/set_privileges_on_database?user={db_user}&database={db_name}&privileges=ALL+PRIVILEGES")
-results['privileges'] = json.loads(r)
+results['privileges'] = json.loads(r).get('status', 0)
 print(r[:200])
 
-# 4. List PassengerApps functions
-print("\n=== PassengerApps module functions ===")
-r_funcs = curl(f"https://{host}:2083/json-api/cpanel?cpanel_jsonapi_module=PassengerApps&cpanel_jsonapi_func=listfuncs&cpanel_jsonapi_apiversion=2")
-print("PassengerApps funcs:", r_funcs[:600])
-
-# 5. Try PassengerApps/register_application with correct params
-print("\n=== Trying PassengerApps/register_application ===")
-import urllib.parse
+# 4. Register Passenger/Node.js App (ok if already exists — will error with duplicate)
+print("\n=== Registering Passenger Node.js App ===")
 app_params = urllib.parse.urlencode({
     "name": "tools",
     "path": f"/home/{user}/tools.zulqurnainj.com",
     "domain": "tools.zulqurnainj.com",
     "base_uri": "/",
-    "app_type": "node",
     "startup_file": "startup.js",
+    "app_type": "node",
     "node_version": "22",
+    "deployment_mode": "production",
 })
 r = curl(f"{uapi}/PassengerApps/register_application?{app_params}")
-print("register_application:", r[:500])
-try:
-    results['nodejs_create'] = json.loads(r)
-except:
-    results['nodejs_create'] = {'status': 0, 'raw': r[:200]}
+reg = json.loads(r)
+results['nodejs_create'] = reg.get('status', 0)
+print(r[:500])
 
-r_versions = r_funcs[:300]
-r_list = ""
+if reg.get('status') == 0 and 'already' in str(reg.get('errors', '')).lower():
+    print("App already exists — skipping (this is OK)")
+    results['nodejs_create'] = 1  # treat as success
 
 print("\n=== Setup complete ===")
-print(json.dumps(results, indent=2)[:800])
+print(json.dumps(results, indent=2))
 
 if token and repo:
     body = f"""## cPanel Server Setup Complete
 
 **MySQL database:** `{db_name}`
 **MySQL user:** `{db_user}`
+**DB password:** stored in GitHub Secret `DB_PASS`
 
-**DB create:** `{results.get('db_create', {}).get('status', '?')}`
-**User create:** `{results.get('user_create', {}).get('status', '?')}`
-**Privileges:** `{results.get('privileges', {}).get('status', '?')}`
-**Node.js App:** `{results.get('nodejs_create', {}).get('status', '?')}`
+| Step | Status |
+|------|--------|
+| DB create | `{results.get('db_create')}` (0=already exists, 1=created) |
+| User create | `{results.get('user_create')}` (0=already exists, 1=created) |
+| Privileges | `{results.get('privileges')}` |
+| Node.js App | `{results.get('nodejs_create')}` |
 
-### Debug — Node.js API responses
+### Next step — run the DB migration
+1. Log into [cPanel phpMyAdmin](https://{host}:2083) → `{db_name}`
+2. Go to SQL tab and paste the contents of `supabase/schema.sql`
+3. Click "Go"
 
-**Available versions raw:** `{r_versions[:300]}`
+### Next step — configure llama.cpp
+Set the `LLAMA_API_URL` secret in GitHub repo settings to your llama.cpp server URL.
 
-**Existing apps raw:** `{r_list[:300]}`
-
-**Create app raw:** `{r[:500]}`
-
-### Next steps
-1. Run the DB migration: paste `supabase/schema.sql` into phpMyAdmin on `{db_name}`
-2. Push to master to trigger the deploy workflow
+### Deployment
+Push to master to trigger the deploy workflow — files will be FTP'd automatically.
 """
     payload = json.dumps({'title': '[setup] cPanel server setup complete', 'body': body}).encode()
     req = urllib.request.Request(
@@ -101,4 +95,4 @@ if token and repo:
     )
     with urllib.request.urlopen(req) as resp:
         d = json.loads(resp.read())
-        print(f"\nIssue #{d['number']}: setup report")
+        print(f"\nIssue #{d['number']}: setup report posted")
