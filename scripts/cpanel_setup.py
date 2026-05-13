@@ -40,18 +40,36 @@ r = curl(f"{uapi}/Mysql/set_privileges_on_database?user={db_user}&database={db_n
 results['privileges'] = json.loads(r)
 print(r[:200])
 
-# 4. Create Node.js App
-print("\n=== Creating Node.js App ===")
+# 4. List available Node.js versions
+print("\n=== Available Node.js versions ===")
+r_versions = curl(f"{uapi}/NodeJS/get_available_node_versions")
+print(r_versions[:500])
+try:
+    versions_data = json.loads(r_versions)
+    available = [v.get('version','?') for v in versions_data.get('data', [])]
+    print("Available versions:", available)
+    node_ver = "22" if "22" in str(available) else (available[-1] if available else "20")
+except Exception as e:
+    print("Could not parse versions:", e)
+    node_ver = "20"
+
+# 5. List existing apps (in case already created)
+print("\n=== Existing Node.js Apps ===")
+r_list = curl(f"{uapi}/NodeJS/list_applications")
+print(r_list[:500])
+
+# 6. Create Node.js App
+print(f"\n=== Creating Node.js App (node_version={node_ver}) ===")
 r = curl(
     f"{uapi}/NodeJS/create_application"
     f"?app_name=tools.zulqurnainj.com"
     f"&app_root=tools.zulqurnainj.com"
     f"&startup_file=server.js"
-    f"&node_version=22"
+    f"&node_version={node_ver}"
     f"&app_env=production"
 )
 results['nodejs_create'] = json.loads(r)
-print(r[:300])
+print("FULL RESPONSE:", r[:1000])
 
 print("\n=== Setup complete ===")
 print(json.dumps(results, indent=2)[:800])
