@@ -32,39 +32,31 @@ jobs:
           CPANEL_USER: ${{ secrets.CPANEL_USER }}
           DB_PASS: ${{ secrets.DB_PASS }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          # LLAMA_API_URL is optional — if unset, offLLama runs embedded (model auto-downloads)
           LLAMA_API_URL: ${{ secrets.LLAMA_API_URL }}
           LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
         run: |
           cp -r .next/static .next/standalone/.next/static
           cp -r public .next/standalone/public
 
-          # Next.js standalone traces JS files but skips native binaries.
-          # Explicitly copy packages that need to be present at runtime.
           mkdir -p .next/standalone/node_modules
 
-          # node-llama-cpp: copy JS package (already in standalone via NFT, but ensure bins too)
           cp -r node_modules/node-llama-cpp .next/standalone/node_modules/
 
-          # @node-llama-cpp/linux-x64: copy the native binary if postinstall downloaded it.
-          # The standalone already has the JS dist, but the bins/ dir is not traced by NFT.
           if [ -f "node_modules/@node-llama-cpp/linux-x64/bins/linux-x64/llama-addon.node" ]; then
             mkdir -p .next/standalone/node_modules/@node-llama-cpp/linux-x64
             cp -r node_modules/@node-llama-cpp/linux-x64/bins \
                   .next/standalone/node_modules/@node-llama-cpp/linux-x64/
             echo "Copied linux-x64 llama-addon.node to standalone"
           else
-            echo "llama-addon.node not found — embedded mode unavailable; set LLAMA_API_URL for HTTP mode"
+            echo "llama-addon.node not found — using LLAMA_API_URL for HTTP mode"
           fi
 
           cp -r node_modules/offllama .next/standalone/node_modules/
           cp -r node_modules/pdf-parse .next/standalone/node_modules/
-          # Copy offllama's runtime deps too
           for dep in lifecycle-utils express commander; do
             [ -d "node_modules/$dep" ] && cp -r "node_modules/$dep" .next/standalone/node_modules/
           done
 
-          # Write .env and startup.js
           python3 - << 'PYEOF'
           import os
           cpanel_user = os.environ['CPANEL_USER']
@@ -104,7 +96,6 @@ jobs:
           print('Wrote startup.js')
           PYEOF
 
-          # Touch tmp/restart.txt — Passenger picks this up to restart the app
           mkdir -p .next/standalone/tmp
           date > .next/standalone/tmp/restart.txt
 
@@ -128,13 +119,15 @@ jobs:
             set xfer:timeout 300;
             open -u \"$FTP_USER\",\"$FTP_PASS\" ftp://$FTP_HOST;
             mirror --reverse --delete --verbose \
-              --exclude .git/ --exclude '.next/cache/' \
+              --exclude .git/ \
+              --exclude '.next/cache/' \
+              --exclude .htaccess \
               .next/standalone/ tools.zulqurnainj.com/;
             quit
           "
-          echo "FTP upload complete — exit $?"
+          echo "FTP upload complete"
 
-      - name: Register/update Passenger app and provision SSL
+      - name: Configure Passenger, write .htaccess, provision SSL
         env:
           H: ${{ secrets.CPANEL_HOST }}
           U: ${{ secrets.CPANEL_USER }}
@@ -149,121 +142,167 @@ jobs:
           uapi = f"https://{h}:2083/execute"
           domain = "tools.zulqurnainj.com"
           app_name = "tools"
+          app_path = f"/home/{u}/{domain}"
 
-          def curl(url, timeout=30):
+          def curl_get(url, timeout=30):
               out = subprocess.check_output(
                   ['curl', '-sk', '-u', f'{u}:{p}', url],
                   text=True, timeout=timeout
               )
-              print(f"  → {url.split('?')[0].split('/')[-2:]}: {out[:300]}")
+              print(f"  GET {url.split('?')[0].split('/')[-1]}: {out[:400]}")
               return out
 
-          def uapi_ok(resp):
+          def curl_post(url, data, timeout=30):
+              cmd = ['curl', '-sk', '-u', f'{u}:{p}', '-X', 'POST']
+              for k, v in data.items():
+                  cmd += ['--data-urlencode', f'{k}={v}']
+              cmd.append(url)
+              out = subprocess.check_output(cmd, text=True, timeout=timeout)
+              print(f"  POST {url.split('/')[-1]}: {out[:400]}")
+              return out
+
+          def ok(resp):
               try:
                   return json.loads(resp).get('status', 0) == 1
               except Exception:
                   return False
 
-          # ── 0. Create subdomain (idempotent — cPanel ignores if it already exists) ──
-          print("\n── Creating subdomain tools.zulqurnainj.com ──")
+          # ── 0. Ensure subdomain exists ──
+          print("\n── Subdomain ──")
           sub_params = urllib.parse.urlencode({
-              "domain":      "tools",
-              "rootdomain":  "zulqurnainj.com",
-              "dir":         f"tools.zulqurnainj.com",
-              "disallowdot": "0",
+              "domain": "tools", "rootdomain": "zulqurnainj.com",
+              "dir": domain, "disallowdot": "0",
           })
-          r_sub = curl(f"{uapi}/SubDomain/addsubdomain?{sub_params}")
-          if uapi_ok(r_sub):
-              print("  Subdomain created — waiting 5s for vhost propagation")
+          r = curl_get(f"{uapi}/SubDomain/addsubdomain?{sub_params}")
+          if ok(r):
+              print("  Subdomain created — waiting 5s")
               time.sleep(5)
           else:
-              print("  Subdomain already exists or non-fatal error — continuing")
+              print("  Subdomain already exists")
 
-          # ── 1. Deregister any existing app so domain binding is set fresh ──
-          # update_application does NOT update the domain/host allowlist — only
-          # register_application does. Deregistering first ensures a clean slate.
-          print("\n── Deregistering existing Passenger app (if any) ──")
-          curl(f"{uapi}/PassengerApps/deregister_application?name={app_name}")
-          time.sleep(2)
+          # ── 1. Diagnose: list current Passenger apps ──
+          print("\n── Current Passenger apps ──")
+          r_list = curl_get(f"{uapi}/PassengerApps/list_applications")
+          try:
+              apps_data = json.loads(r_list)
+              print("  Full response:", json.dumps(apps_data, indent=2)[:800])
+          except Exception as e:
+              print(f"  Could not parse: {e}")
 
-          # ── 2. Register app fresh — try Node versions until one is accepted ──
-          print("\n── Registering Passenger app ──")
+          # ── 2. Deregister + re-register to reset host allowlist ──
+          print("\n── Deregister + Register ──")
+          curl_get(f"{uapi}/PassengerApps/deregister_application?name={app_name}")
+          time.sleep(3)
+
           registered_node = None
           for node_ver in ("22", "20", "18"):
               reg_params = urllib.parse.urlencode({
-                  "name":             app_name,
-                  "path":             f"/home/{u}/{domain}",
-                  "domain":           domain,
-                  "base_uri":         "/",
-                  "startup_file":     "startup.js",
-                  "app_type":         "node",
-                  "node_version":     node_ver,
-                  "deployment_mode":  "production",
+                  "name": app_name, "path": app_path, "domain": domain,
+                  "base_uri": "/", "startup_file": "startup.js",
+                  "app_type": "node", "node_version": node_ver,
+                  "deployment_mode": "production",
               })
-              r_reg = curl(f"{uapi}/PassengerApps/register_application?{reg_params}")
-              if uapi_ok(r_reg):
-                  print(f"  App registered OK with Node.js {node_ver}")
+              r_reg = curl_get(f"{uapi}/PassengerApps/register_application?{reg_params}")
+              if ok(r_reg):
+                  print(f"  Registered with Node.js {node_ver}")
                   registered_node = node_ver
                   break
               else:
-                  print(f"  Node.js {node_ver} not accepted or app already exists — trying next")
+                  print(f"  Node.js {node_ver} rejected, trying next")
           if not registered_node:
-              print("  App already registered or registration failed — will update")
               registered_node = "22"
+              print(f"  All registrations failed — defaulting to node {registered_node}")
 
-          # ── 3. Update to ensure correct settings ──
-          print("\n── Updating app settings ──")
-          upd_params = urllib.parse.urlencode({
-              "name":             app_name,
-              "startup_file":     "startup.js",
-              "app_type":         "node",
-              "node_version":     registered_node,
-              "deployment_mode":  "production",
-          })
-          r_upd = curl(f"{uapi}/PassengerApps/update_application?{upd_params}")
-          print("  Update:", "OK" if uapi_ok(r_upd) else "failed (non-fatal)")
-
-          # ── 4. Restart cycle ──
-          print("\n── Restarting app ──")
-          curl(f"{uapi}/PassengerApps/disable_application?name={app_name}")
-          time.sleep(2)
-          r_en = curl(f"{uapi}/PassengerApps/enable_application?name={app_name}")
-          print("  Enable:", "OK" if uapi_ok(r_en) else "failed")
-          # Give Passenger time to spawn the process before ACME challenge
-          print("  Waiting 15s for app to start...")
-          time.sleep(15)
-
-          # ── 5. Provision SSL ──
-          # Try Let's Encrypt UAPI first, fall back to AutoSSL trigger
-          print("\n── Provisioning SSL for", domain, "──")
-          ssl_params = urllib.parse.urlencode({
-              "domains[0]": domain,
-              "keytype":    "prime256v1",
-          })
-          r_ssl = curl(f"{uapi}/LetsEncrypt/issue?{ssl_params}", timeout=120)
-          if uapi_ok(r_ssl):
-              print("  Let's Encrypt cert issued OK")
-          else:
-              print("  LetsEncrypt/issue unavailable or failed — triggering AutoSSL")
-              r_auto = curl(f"{uapi}/SSL/start_autossl_check_cpanel_domains")
-              print("  AutoSSL triggered:", r_auto[:200])
-
-          # ── 6. Verify app is reachable ──
-          print("\n── Verifying app ──")
-          time.sleep(8)
-          for scheme in ("https", "http"):
-              try:
-                  code = subprocess.check_output(
-                      ['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
-                       '--max-time', '15',
-                       f'{scheme}://{domain}/text-to-leads'],
-                      text=True, timeout=20
-                  )
-                  print(f"  {scheme}://{domain}/text-to-leads → HTTP {code}")
-                  if code in ('200', '307', '308'):
-                      print(f"  ✓ App is live over {scheme}")
+          # ── 3. Discover the actual Node.js binary path from the registered app ──
+          print("\n── Discovering Node.js binary path ──")
+          nodejs_path = None
+          r_list2 = curl_get(f"{uapi}/PassengerApps/list_applications")
+          try:
+              for app in json.loads(r_list2).get('data', {}).get('applications', []):
+                  if isinstance(app, dict) and app.get('name') == app_name:
+                      nodejs_path = (app.get('nodejs_path') or app.get('node_path')
+                                     or app.get('nodejs_binary') or app.get('node_binary'))
+                      print(f"  App record: {app}")
                       break
-              except Exception as e:
-                  print(f"  {scheme} check failed: {e}")
+          except Exception as e:
+              print(f"  Parse error: {e}")
+
+          if not nodejs_path:
+              # Standard cPanel nodevenv path
+              nodejs_path = f"/home/{u}/nodevenv/{domain}/{registered_node}/bin/node"
+              print(f"  Using standard nodevenv path: {nodejs_path}")
+          else:
+              print(f"  Node.js path from API: {nodejs_path}")
+
+          # ── 4. Write .htaccess via cPanel Fileman API ──
+          # This is what cPanel's own "Setup Node.js App" GUI writes.
+          # We do it explicitly so it survives across deploys.
+          htaccess = (
+              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n"
+              "PassengerEnabled On\n"
+              "PassengerBaseURI /\n"
+              f"PassengerNodejs {nodejs_path}\n"
+              f"PassengerAppRoot {app_path}\n"
+              "PassengerAppType node\n"
+              "PassengerStartupFile startup.js\n"
+              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n"
+          )
+          print(f"\n── Writing .htaccess ──\n{htaccess}")
+          r_file = curl_post(
+              f"{uapi}/Fileman/save_file_content",
+              {"dir": app_path, "filename": ".htaccess", "content": htaccess}
+          )
+          print("  .htaccess write:", "OK" if ok(r_file) else f"failed — {r_file[:200]}")
+
+          # ── 5. Restart cycle ──
+          print("\n── Restart ──")
+          curl_get(f"{uapi}/PassengerApps/disable_application?name={app_name}")
+          time.sleep(3)
+          r_en = curl_get(f"{uapi}/PassengerApps/enable_application?name={app_name}")
+          print("  Enable:", "OK" if ok(r_en) else "failed")
+          print("  Waiting 20s for app to start...")
+          time.sleep(20)
+
+          # ── 6. Verify HTTP ──
+          print("\n── HTTP check ──")
+          try:
+              code = subprocess.check_output(
+                  ['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
+                   '--max-time', '15', f'http://{domain}/text-to-leads'],
+                  text=True, timeout=20
+              )
+              print(f"  http://{domain}/text-to-leads → {code}")
+              if code not in ('200', '301', '302', '307', '308'):
+                  print("  ✗ App not responding — check Passenger logs on server")
+              else:
+                  print("  ✓ App is up on HTTP")
+          except Exception as e:
+              print(f"  HTTP check failed: {e}")
+
+          # ── 7. Provision SSL ──
+          print("\n── SSL ──")
+          ssl_params = urllib.parse.urlencode({
+              "domains[0]": domain, "keytype": "prime256v1",
+          })
+          r_ssl = curl_get(f"{uapi}/LetsEncrypt/issue?{ssl_params}", timeout=180)
+          if ok(r_ssl):
+              print("  ✓ Let's Encrypt cert issued")
+          else:
+              print("  LetsEncrypt/issue failed — triggering AutoSSL")
+              r_auto = curl_get(f"{uapi}/SSL/start_autossl_check_cpanel_domains")
+              print("  AutoSSL:", r_auto[:200])
+
+          # ── 8. Final HTTPS check ──
+          print("\n── HTTPS check ──")
+          time.sleep(5)
+          try:
+              code = subprocess.check_output(
+                  ['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
+                   '--max-time', '15', f'https://{domain}/text-to-leads'],
+                  text=True, timeout=20
+              )
+              print(f"  https://{domain}/text-to-leads → {code}")
+          except Exception as e:
+              print(f"  HTTPS check: {e}")
 
           PYEOF
