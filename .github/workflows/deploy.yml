@@ -164,7 +164,8 @@ jobs:
                   ['curl', '-sk', '-u', f'{u}:{p}', url],
                   text=True, timeout=timeout
               )
-              print(f"  GET {url.split('?')[0].split('/')[-1]}: {out[:400]}")
+              # Print FULL response for diagnosis (no truncation on key calls)
+              print(f"  GET {url.split('?')[0].split('/')[-1]}: {out[:1200]}")
               return out
 
           def curl_post(url, data, timeout=30):
@@ -173,14 +174,31 @@ jobs:
                   cmd += ['--data-urlencode', f'{k}={v}']
               cmd.append(url)
               out = subprocess.check_output(cmd, text=True, timeout=timeout)
-              print(f"  POST {url.split('/')[-1]}: {out[:400]}")
+              print(f"  POST {url.split('/')[-1]}: {out[:1200]}")
               return out
 
           def ok(resp):
+              """cPanel UAPI wraps status inside 'result': {'status': 1}.
+              Handle both wrapped and bare formats."""
               try:
-                  return json.loads(resp).get('status', 0) == 1
+                  data = json.loads(resp)
+                  # Standard UAPI: {"result": {"status": 1, ...}}
+                  if 'result' in data:
+                      return data['result'].get('status', 0) == 1
+                  # Some endpoints return bare: {"status": 1, ...}
+                  return data.get('status', 0) == 1
               except Exception:
                   return False
+
+          def extract_data(resp):
+              """Extract the 'data' payload regardless of UAPI wrapping."""
+              try:
+                  data = json.loads(resp)
+                  if 'result' in data:
+                      return data['result'].get('data') or {}
+                  return data.get('data') or {}
+              except Exception:
+                  return {}
 
           # ── 0. Ensure subdomain exists ──
           print("\n── Subdomain ──")
@@ -193,22 +211,23 @@ jobs:
               print("  Subdomain created — waiting 5s")
               time.sleep(5)
           else:
-              print("  Subdomain already exists")
+              print("  Subdomain already exists or error (see raw above)")
 
-          # ── 1. Diagnose: list current Passenger apps ──
+          # ── 1. List current Passenger apps (full diagnostic) ──
           print("\n── Current Passenger apps ──")
           r_list = curl_get(f"{uapi}/PassengerApps/list_applications")
           try:
-              apps_data = json.loads(r_list)
-              print("  Full response:", json.dumps(apps_data, indent=2)[:800])
+              print("  PARSED:", json.dumps(json.loads(r_list), indent=2)[:2000])
           except Exception as e:
               print(f"  Could not parse: {e}")
 
-          # ── 2. Deregister + re-register to reset host allowlist ──
-          print("\n── Deregister + Register ──")
-          curl_get(f"{uapi}/PassengerApps/deregister_application?name={app_name}")
+          # ── 2. Deregister then re-register ──
+          print("\n── Deregister ──")
+          r_dereg = curl_get(f"{uapi}/PassengerApps/deregister_application?name={app_name}")
+          print(f"  Deregister ok={ok(r_dereg)}")
           time.sleep(3)
 
+          print("\n── Register ──")
           registered_node = None
           for node_ver in ("22", "20", "18"):
               reg_params = urllib.parse.urlencode({
@@ -218,59 +237,96 @@ jobs:
                   "deployment_mode": "production",
               })
               r_reg = curl_get(f"{uapi}/PassengerApps/register_application?{reg_params}")
-              if ok(r_reg):
-                  print(f"  Registered with Node.js {node_ver}")
+              result_ok = ok(r_reg)
+              print(f"  Node.js {node_ver} → ok={result_ok}")
+              if result_ok:
                   registered_node = node_ver
                   break
-              else:
-                  print(f"  Node.js {node_ver} rejected, trying next")
           if not registered_node:
+              # Registration may have succeeded even if ok() says False —
+              # try to discover the node version from list_applications.
+              print("  All ok() checks returned False — checking list_applications for actual state")
               registered_node = "22"
-              print(f"  All registrations failed — defaulting to node {registered_node}")
 
-          # ── 3. Discover the actual Node.js binary path from the registered app ──
-          print("\n── Discovering Node.js binary path ──")
+          # ── 3. Discover Node.js binary path ──
+          print("\n── Discover nodejs_path ──")
           nodejs_path = None
           r_list2 = curl_get(f"{uapi}/PassengerApps/list_applications")
           try:
-              for app in json.loads(r_list2).get('data', {}).get('applications', []):
+              raw2 = json.loads(r_list2)
+              print("  PARSED:", json.dumps(raw2, indent=2)[:2000])
+              # Try both wrapped and bare formats
+              apps_container = (
+                  raw2.get('result', {}).get('data', {})
+                  or raw2.get('data', {})
+              )
+              apps = apps_container.get('applications', [])
+              for app in apps:
                   if isinstance(app, dict) and app.get('name') == app_name:
-                      nodejs_path = (app.get('nodejs_path') or app.get('node_path')
-                                     or app.get('nodejs_binary') or app.get('node_binary'))
-                      print(f"  App record: {app}")
+                      nodejs_path = (
+                          app.get('nodejs_path') or app.get('node_path')
+                          or app.get('nodejs_binary') or app.get('node_binary')
+                      )
+                      registered_node = str(app.get('node_version') or registered_node)
+                      print(f"  Found app: {json.dumps(app, indent=2)}")
                       break
           except Exception as e:
               print(f"  Parse error: {e}")
 
           if not nodejs_path:
-              # Standard cPanel nodevenv path
               nodejs_path = f"/home/{u}/nodevenv/{domain}/{registered_node}/bin/node"
-              print(f"  Using standard nodevenv path: {nodejs_path}")
+              print(f"  Falling back to nodevenv path: {nodejs_path}")
           else:
-              print(f"  Node.js path from API: {nodejs_path}")
+              print(f"  nodejs_path from API: {nodejs_path}")
 
-          # ── 4. Restart cycle ──
+          # ── 4. Write .htaccess via Fileman API (authoritative, post-registration) ──
+          # The FTP-uploaded .htaccess has hardcoded node 22; this overwrites with
+          # the actual registered node version discovered above.
+          print("\n── Write .htaccess via Fileman ──")
+          htaccess = (
+              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n"
+              "PassengerEnabled On\n"
+              "PassengerBaseURI /\n"
+              f"PassengerNodejs {nodejs_path}\n"
+              f"PassengerAppRoot {app_path}\n"
+              "PassengerAppType node\n"
+              "PassengerStartupFile startup.js\n"
+              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n"
+          )
+          print(f"  Content:\n{htaccess}")
+          r_file = curl_post(
+              f"{uapi}/Fileman/save_file_content",
+              {"dir": app_path, "filename": ".htaccess", "content": htaccess}
+          )
+          print(f"  Fileman ok={ok(r_file)}")
+
+          # ── 5. Restart cycle ──
           print("\n── Restart ──")
-          curl_get(f"{uapi}/PassengerApps/disable_application?name={app_name}")
+          r_dis = curl_get(f"{uapi}/PassengerApps/disable_application?name={app_name}")
+          print(f"  Disable ok={ok(r_dis)}")
           time.sleep(3)
           r_en = curl_get(f"{uapi}/PassengerApps/enable_application?name={app_name}")
-          print("  Enable:", "OK" if ok(r_en) else "failed")
-          print("  Waiting 20s for app to start...")
-          time.sleep(20)
+          print(f"  Enable ok={ok(r_en)}")
+          print("  Waiting 25s for app to start...")
+          time.sleep(25)
 
-          # ── 6. Verify HTTP ──
+          # ── 6. HTTP check ──
           print("\n── HTTP check ──")
           try:
               code = subprocess.check_output(
-                  ['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
-                   '--max-time', '15', f'http://{domain}/text-to-leads'],
+                  ['curl', '-sk', '-i', '--max-time', '15',
+                   f'http://{domain}/text-to-leads'],
                   text=True, timeout=20
               )
-              print(f"  http://{domain}/text-to-leads → {code}")
-              if code not in ('200', '301', '302', '307', '308'):
-                  print("  ✗ App not responding — check Passenger logs on server")
-              else:
+              first_line = code.split('\n')[0]
+              # Also show x-deny-reason if present
+              deny = next((l for l in code.split('\n') if 'deny' in l.lower()), '')
+              print(f"  Response: {first_line}  {deny}")
+              if '200' in first_line or '301' in first_line or '302' in first_line:
                   print("  ✓ App is up on HTTP")
+              else:
+                  print("  ✗ Not 2xx/3xx — full headers:")
+                  print(code[:600])
           except Exception as e:
               print(f"  HTTP check failed: {e}")
 
@@ -280,24 +336,24 @@ jobs:
               "domains[0]": domain, "keytype": "prime256v1",
           })
           r_ssl = curl_get(f"{uapi}/LetsEncrypt/issue?{ssl_params}", timeout=180)
-          if ok(r_ssl):
-              print("  ✓ Let's Encrypt cert issued")
-          else:
-              print("  LetsEncrypt/issue failed — triggering AutoSSL")
+          print(f"  LetsEncrypt ok={ok(r_ssl)}")
+          if not ok(r_ssl):
+              print("  Trying AutoSSL fallback")
               r_auto = curl_get(f"{uapi}/SSL/start_autossl_check_cpanel_domains")
-              print("  AutoSSL:", r_auto[:200])
+              print(f"  AutoSSL ok={ok(r_auto)}")
 
-          # ── 8. Final HTTPS check ──
-          print("\n── HTTPS check ──")
-          time.sleep(5)
-          try:
-              code = subprocess.check_output(
-                  ['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
-                   '--max-time', '15', f'https://{domain}/text-to-leads'],
-                  text=True, timeout=20
-              )
-              print(f"  https://{domain}/text-to-leads → {code}")
-          except Exception as e:
-              print(f"  HTTPS check: {e}")
+          # ── 8. Final checks ──
+          print("\n── Final checks ──")
+          time.sleep(10)
+          for scheme in ('http', 'https'):
+              try:
+                  code = subprocess.check_output(
+                      ['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
+                       '--max-time', '15', f'{scheme}://{domain}/text-to-leads'],
+                      text=True, timeout=20
+                  )
+                  print(f"  {scheme}://{domain}/text-to-leads → {code}")
+              except Exception as e:
+                  print(f"  {scheme} check: {e}")
 
           PYEOF
