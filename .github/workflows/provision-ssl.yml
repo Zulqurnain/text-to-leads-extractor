@@ -31,8 +31,12 @@ jobs:
               return out
 
           def uapi_ok(resp):
+              # cPanel UAPI wraps as {"result": {"status": 1, ...}}
               try:
-                  return json.loads(resp).get('status', 0) == 1
+                  data = json.loads(resp)
+                  if 'result' in data:
+                      return data['result'].get('status', 0) == 1
+                  return data.get('status', 0) == 1
               except Exception:
                   return False
 
