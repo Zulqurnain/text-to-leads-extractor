@@ -39,11 +39,25 @@ jobs:
           cp -r .next/static .next/standalone/.next/static
           cp -r public .next/standalone/public
 
-          # Copy server-external packages into standalone so they're available at runtime.
-          # node-llama-cpp uses native binaries — must be for the target OS (linux-x64 = same as runner).
+          # Next.js standalone traces JS files but skips native binaries.
+          # Explicitly copy packages that need to be present at runtime.
           mkdir -p .next/standalone/node_modules
-          cp -r node_modules/offllama .next/standalone/node_modules/
+
+          # node-llama-cpp: copy JS package (already in standalone via NFT, but ensure bins too)
           cp -r node_modules/node-llama-cpp .next/standalone/node_modules/
+
+          # @node-llama-cpp/linux-x64: copy the native binary if postinstall downloaded it.
+          # The standalone already has the JS dist, but the bins/ dir is not traced by NFT.
+          if [ -f "node_modules/@node-llama-cpp/linux-x64/bins/linux-x64/llama-addon.node" ]; then
+            mkdir -p .next/standalone/node_modules/@node-llama-cpp/linux-x64
+            cp -r node_modules/@node-llama-cpp/linux-x64/bins \
+                  .next/standalone/node_modules/@node-llama-cpp/linux-x64/
+            echo "Copied linux-x64 llama-addon.node to standalone"
+          else
+            echo "llama-addon.node not found — embedded mode unavailable; set LLAMA_API_URL for HTTP mode"
+          fi
+
+          cp -r node_modules/offllama .next/standalone/node_modules/
           cp -r node_modules/pdf-parse .next/standalone/node_modules/
           # Copy offllama's runtime deps too
           for dep in lifecycle-utils express commander; do
