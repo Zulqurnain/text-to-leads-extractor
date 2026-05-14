@@ -179,7 +179,14 @@ jobs:
           else:
               print("  Subdomain already exists or non-fatal error — continuing")
 
-          # ── 1. Register app — try Node versions until one is accepted ──
+          # ── 1. Deregister any existing app so domain binding is set fresh ──
+          # update_application does NOT update the domain/host allowlist — only
+          # register_application does. Deregistering first ensures a clean slate.
+          print("\n── Deregistering existing Passenger app (if any) ──")
+          curl(f"{uapi}/PassengerApps/deregister_application?name={app_name}")
+          time.sleep(2)
+
+          # ── 2. Register app fresh — try Node versions until one is accepted ──
           print("\n── Registering Passenger app ──")
           registered_node = None
           for node_ver in ("22", "20", "18"):
@@ -204,7 +211,7 @@ jobs:
               print("  App already registered or registration failed — will update")
               registered_node = "22"
 
-          # ── 2. Update to ensure correct settings ──
+          # ── 3. Update to ensure correct settings ──
           print("\n── Updating app settings ──")
           upd_params = urllib.parse.urlencode({
               "name":             app_name,
@@ -216,7 +223,7 @@ jobs:
           r_upd = curl(f"{uapi}/PassengerApps/update_application?{upd_params}")
           print("  Update:", "OK" if uapi_ok(r_upd) else "failed (non-fatal)")
 
-          # ── 3. Restart cycle ──
+          # ── 4. Restart cycle ──
           print("\n── Restarting app ──")
           curl(f"{uapi}/PassengerApps/disable_application?name={app_name}")
           time.sleep(2)
@@ -226,7 +233,7 @@ jobs:
           print("  Waiting 15s for app to start...")
           time.sleep(15)
 
-          # ── 4. Provision SSL ──
+          # ── 5. Provision SSL ──
           # Try Let's Encrypt UAPI first, fall back to AutoSSL trigger
           print("\n── Provisioning SSL for", domain, "──")
           ssl_params = urllib.parse.urlencode({
@@ -241,7 +248,7 @@ jobs:
               r_auto = curl(f"{uapi}/SSL/start_autossl_check_cpanel_domains")
               print("  AutoSSL triggered:", r_auto[:200])
 
-          # ── 5. Verify app is reachable ──
+          # ── 6. Verify app is reachable ──
           print("\n── Verifying app ──")
           time.sleep(8)
           for scheme in ("https", "http"):
