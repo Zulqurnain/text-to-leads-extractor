@@ -1,11 +1,11 @@
-name: Tools Doctor — diagnose tools.zulqurnainj.com via cPanel UAPI
+name: Tools Doctor v3 — deep probe via UAPI
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'diagnose | fix-passenger | fix-ssl | full-fix'
-        default: 'full-fix'
+        description: 'diagnose | restart | fix-passenger | fix-ssl | full-fix'
+        default: 'diagnose'
         required: true
   push:
     branches: [master]
@@ -23,325 +23,275 @@ permissions:
 jobs:
   doctor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
-      - name: Doctor (UAPI-only, no SSH required)
+      - name: Doctor v3
         env:
-          MODE: ${{ inputs.mode || 'full-fix' }}
+          MODE: ${{ inputs.mode || 'diagnose' }}
           CPANEL_HOST: ${{ secrets.CPANEL_HOST }}
           CPANEL_USER: ${{ secrets.CPANEL_USER }}
           CPANEL_PASS: ${{ secrets.CPANEL_PASS }}
         run: |
           set +e
           python3 << 'PYEOF'
-          import os, subprocess, json, urllib.parse, datetime, time, base64, sys
+          import os, subprocess, json, urllib.parse, datetime, time
 
-          h = os.environ.get('CPANEL_HOST','')
-          u = os.environ.get('CPANEL_USER','')
-          p = os.environ.get('CPANEL_PASS','')
-          mode = os.environ.get('MODE','full-fix')
+          h = os.environ['CPANEL_HOST']
+          u = os.environ['CPANEL_USER']
+          p = os.environ['CPANEL_PASS']
+          mode = os.environ.get('MODE','diagnose')
           uapi = f"https://{h}:2083/execute"
           domain = "tools.zulqurnainj.com"
           app_name = "tools"
           app_path = f"/home/{u}/{domain}"
 
-          out_lines = []
-          def log(s):
-              out_lines.append(s)
-              print(s)
+          out = []
+          def log(s): out.append(s); print(s)
 
-          def curl_get(url, timeout=60):
+          def cget(url, timeout=60):
               try:
-                  return subprocess.check_output(
-                      ['curl', '-sk', '-u', f'{u}:{p}', url],
-                      text=True, timeout=timeout
-                  )
+                  return subprocess.check_output(['curl','-sk','-u',f'{u}:{p}',url], text=True, timeout=timeout)
+              except subprocess.TimeoutExpired:
+                  return "TIMEOUT"
               except Exception as e:
-                  return f"CURL_ERR: {e}"
+                  return f"ERR: {e}"
 
-          def curl_post(url, data, timeout=60):
-              cmd = ['curl', '-sk', '-u', f'{u}:{p}', '-X', 'POST']
-              for k, v in data.items():
-                  cmd += ['--data-urlencode', f'{k}={v}']
+          def cpost(url, data, timeout=60):
+              cmd = ['curl','-sk','-u',f'{u}:{p}','-X','POST']
+              for k,v in data.items(): cmd += ['--data-urlencode', f'{k}={v}']
               cmd.append(url)
               try:
                   return subprocess.check_output(cmd, text=True, timeout=timeout)
               except Exception as e:
-                  return f"CURL_ERR: {e}"
+                  return f"ERR: {e}"
 
-          def parse(resp):
+          def parse(r):
               try:
-                  d = json.loads(resp)
-                  if 'result' in d:
-                      return d['result']
-                  return d
-              except Exception:
-                  return {'_raw': resp[:300], '_parse_err': True}
+                  d = json.loads(r)
+                  return d.get('result', d) if 'result' in d else d
+              except: return {'_raw': r[:500]}
 
-          def ok(parsed):
-              return isinstance(parsed, dict) and parsed.get('status') == 1
+          def ok(p): return isinstance(p, dict) and p.get('status') == 1
 
-          # Header
-          log(f"# tools-doctor diagnostic (UAPI-only)")
-          log(f"- timestamp: {datetime.datetime.utcnow().isoformat()}Z")
-          log(f"- mode: {mode}")
+          log(f"# Doctor v3 — {datetime.datetime.utcnow().isoformat()}Z mode={mode}")
           log(f"- commit: {os.environ.get('GITHUB_SHA','?')}")
           log(f"- run: https://github.com/Zulqurnain/text-to-leads-extractor/actions/runs/{os.environ.get('GITHUB_RUN_ID','?')}")
-          log("")
 
-          # ── External probes ──
-          log("## External probes (from runner)")
+          # ── List ALL items (files + dirs) in app dir ──
+          log("\n## App dir listing (files + dirs)")
           log("```")
-          try:
-              dns = subprocess.check_output(['getent', 'ahosts', domain], text=True, timeout=10)
-              log("DNS: " + dns.split('\n')[0])
-          except Exception as e:
-              log(f"DNS err: {e}")
-          for url in (f"http://{domain}/text-to-leads", f"https://{domain}/text-to-leads"):
-              try:
-                  r = subprocess.check_output(
-                      ['curl', '-sk', '-i', '--max-time', '15', '-w', '\n@@@ http_code=%{http_code}', url],
-                      text=True, timeout=20
-                  )
-                  log(f"--- {url} ---")
-                  log(r[:1500])
-              except subprocess.CalledProcessError as e:
-                  log(f"{url}: CalledProcessError code={e.returncode} stderr={(e.stderr or '')[:200]}")
-              except Exception as e:
-                  log(f"{url}: {e}")
-          # TLS cert info
-          try:
-              tls = subprocess.run(
-                  ['bash','-c',f'echo | openssl s_client -connect {domain}:443 -servername {domain} 2>/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>&1'],
-                  capture_output=True, text=True, timeout=20
-              )
-              log("TLS:\n" + (tls.stdout or '') + (tls.stderr or ''))
-          except Exception as e:
-              log(f"TLS err: {e}")
+          r = cget(f"{uapi}/Fileman/list_files?{urllib.parse.urlencode({'dir':app_path,'types':'file|dir'})}")
+          d = parse(r)
+          if isinstance(d, dict) and 'data' in d:
+              for f in (d['data'] or [])[:100]:
+                  if isinstance(f, dict):
+                      log(f"  [{f.get('type','?')}] {f.get('file','?')} ({f.get('size','?')} bytes)")
+          else:
+              log(json.dumps(d, indent=2)[:1500])
           log("```")
 
-          # ── UAPI: list Passenger apps ──
-          log("\n## UAPI: PassengerApps.list_applications")
+          # ── Check .next directory ──
+          log("\n## .next/ directory")
           log("```")
-          r = curl_get(f"{uapi}/PassengerApps/list_applications")
-          p_list = parse(r)
-          log(json.dumps(p_list, indent=2)[:3000])
-          log("```")
-
-          # ── UAPI: get_file_content for .htaccess ──
-          log("\n## UAPI: Fileman.get_file_content .htaccess")
-          log("```")
-          ht_params = urllib.parse.urlencode({"dir": app_path, "file": ".htaccess"})
-          r = curl_get(f"{uapi}/Fileman/get_file_content?{ht_params}")
-          ht_data = parse(r)
-          log(json.dumps(ht_data, indent=2)[:2000])
+          r = cget(f"{uapi}/Fileman/list_files?{urllib.parse.urlencode({'dir':app_path+'/.next','types':'file|dir'})}")
+          d = parse(r)
+          if isinstance(d, dict) and 'data' in d:
+              for f in (d['data'] or [])[:30]:
+                  if isinstance(f, dict):
+                      log(f"  [{f.get('type','?')}] {f.get('file','?')}")
+          else:
+              log(json.dumps(d, indent=2)[:800])
           log("```")
 
-          # ── UAPI: list_files for app dir ──
-          log("\n## UAPI: Fileman.list_files app dir")
+          # ── Check node_modules ──
+          log("\n## node_modules existence")
           log("```")
-          lf_params = urllib.parse.urlencode({"dir": app_path})
-          r = curl_get(f"{uapi}/Fileman/list_files?{lf_params}&types=file")
-          lf_data = parse(r)
-          # Truncate but show all filenames
-          if isinstance(lf_data, dict) and 'data' in lf_data:
-              files = lf_data['data'] or []
-              log(f"Found {len(files)} files:")
-              for f in files[:80]:
+          r = cget(f"{uapi}/Fileman/list_files?{urllib.parse.urlencode({'dir':app_path+'/node_modules','types':'dir'})}")
+          d = parse(r)
+          if isinstance(d, dict) and 'data' in d:
+              dirs = [f for f in (d['data'] or []) if isinstance(f, dict)]
+              log(f"  Found {len(dirs)} subdirs (showing first 15):")
+              for f in dirs[:15]:
+                  log(f"  {f.get('file','?')}")
+          else:
+              log(json.dumps(d, indent=2)[:600])
+          log("```")
+
+          # ── Check nodevenv ──
+          log("\n## nodevenv/tools.zulqurnainj.com")
+          log("```")
+          r = cget(f"{uapi}/Fileman/list_files?{urllib.parse.urlencode({'dir':f'/home/{u}/nodevenv/{domain}','types':'file|dir'})}")
+          d = parse(r)
+          if isinstance(d, dict) and 'data' in d:
+              for f in (d['data'] or []):
+                  if isinstance(f, dict):
+                      log(f"  [{f.get('type','?')}] {f.get('file','?')}")
+          else:
+              log(json.dumps(d, indent=2)[:600])
+          log("```")
+
+          # ── Read .env to confirm structure ──
+          log("\n## .env content (sanitized)")
+          log("```")
+          r = cget(f"{uapi}/Fileman/get_file_content?{urllib.parse.urlencode({'dir':app_path,'file':'.env'})}")
+          d = parse(r)
+          if isinstance(d, dict) and 'data' in d and isinstance(d['data'], dict):
+              content = d['data'].get('content','')
+              for line in content.split('\n'):
+                  if any(s in line.upper() for s in ['PASS','SECRET','KEY=']):
+                      k = line.split('=',1)[0] if '=' in line else line
+                      log(f"  {k}=<redacted>")
+                  else:
+                      log(f"  {line}")
+          else:
+              log(json.dumps(d, indent=2)[:500])
+          log("```")
+
+          # ── Read startup.js ──
+          log("\n## startup.js content")
+          log("```")
+          r = cget(f"{uapi}/Fileman/get_file_content?{urllib.parse.urlencode({'dir':app_path,'file':'startup.js'})}")
+          d = parse(r)
+          if isinstance(d, dict) and 'data' in d and isinstance(d['data'], dict):
+              log(d['data'].get('content','')[:1000])
+          else:
+              log(json.dumps(d, indent=2)[:500])
+          log("```")
+
+          # ── Passenger app state ──
+          log("\n## PassengerApps.list_applications")
+          log("```")
+          r = cget(f"{uapi}/PassengerApps/list_applications")
+          log(json.dumps(parse(r), indent=2)[:2000])
+          log("```")
+
+          # ── Passenger error log ──
+          log("\n## Passenger error log (~/logs/ + ~/.cl.selector/)")
+          log("```")
+          # Try various log locations
+          log_paths = [
+              (f'/home/{u}/logs', 'tools.zulqurnainj.com.error.log'),
+              (f'/home/{u}/logs', 'error_log'),
+              (f'/home/{u}/.cl.selector', 'passenger_log'),
+              (f'/home/{u}', 'error_log'),
+          ]
+          for dir_, fname in log_paths:
+              r = cget(f"{uapi}/Fileman/get_file_content?{urllib.parse.urlencode({'dir':dir_,'file':fname})}")
+              d = parse(r)
+              if isinstance(d, dict) and 'data' in d and isinstance(d['data'], dict):
+                  c = d['data'].get('content','')
+                  if c:
+                      log(f"--- {dir_}/{fname} (last 2000 chars) ---")
+                      log(c[-2000:])
+          # Also list ~/logs to see what's there
+          r = cget(f"{uapi}/Fileman/list_files?{urllib.parse.urlencode({'dir':f'/home/{u}/logs','types':'file'})}")
+          d = parse(r)
+          if isinstance(d, dict) and 'data' in d:
+              log(f"\n--- ~/logs directory ---")
+              for f in (d['data'] or [])[:20]:
                   if isinstance(f, dict):
                       log(f"  {f.get('file','?')} ({f.get('size','?')} bytes)")
+          log("```")
+
+          # ── Available SSL cert info ──
+          log("\n## SSL.list_certs")
+          log("```")
+          r = cget(f"{uapi}/SSL/list_certs")
+          d = parse(r)
+          if isinstance(d, dict) and 'data' in d:
+              for c in (d['data'] or [])[:10]:
+                  log(f"  domains={c.get('domains','?')} expires={c.get('not_after','?')}")
           else:
-              log(json.dumps(lf_data, indent=2)[:1000])
+              log(json.dumps(d, indent=2)[:600])
           log("```")
 
-          # ── UAPI: SSL certs ──
-          log("\n## UAPI: SSL.list_certs")
-          log("```")
-          r = curl_get(f"{uapi}/SSL/list_certs")
-          ssl_data = parse(r)
-          if isinstance(ssl_data, dict) and 'data' in ssl_data:
-              for c in (ssl_data['data'] or [])[:5]:
-                  log(f"  domains={c.get('domains','?')} issuer={c.get('issuer','?')} expires={c.get('not_after','?')}")
-          else:
-              log(json.dumps(ssl_data, indent=2)[:1000])
-          log("```")
+          # ── ACTIONS ──
 
-          # ── UAPI: installed SSL on domain ──
-          log("\n## UAPI: SSL.installed_host")
-          log("```")
-          inst_params = urllib.parse.urlencode({"domain": domain})
-          r = curl_get(f"{uapi}/SSL/installed_host?{inst_params}")
-          log(json.dumps(parse(r), indent=2)[:1500])
-          log("```")
-
-          # ── FIX-PASSENGER ──
-          if mode in ('fix-passenger','full-fix'):
-              log("\n## Apply fix-passenger")
+          if mode in ('restart','fix-passenger','full-fix'):
+              log("\n## Restart Passenger (no re-register)")
               log("```")
-              # Deregister first to clear stale state
-              r = curl_get(f"{uapi}/PassengerApps/deregister_application?name={app_name}")
-              log(f"deregister: ok={ok(parse(r))}")
-              time.sleep(3)
-              # Register
-              registered_node = None
-              for node_ver in ('22','20','18'):
-                  reg_params = urllib.parse.urlencode({
-                      "name": app_name, "path": app_path, "domain": domain,
-                      "base_uri": "/", "startup_file": "startup.js",
-                      "app_type": "node", "node_version": node_ver,
-                      "deployment_mode": "production",
-                  })
-                  r = curl_get(f"{uapi}/PassengerApps/register_application?{reg_params}")
-                  parsed = parse(r)
-                  log(f"register node {node_ver}: ok={ok(parsed)} resp={json.dumps(parsed)[:200]}")
-                  if ok(parsed):
-                      registered_node = node_ver
-                      break
-              if not registered_node:
-                  registered_node = '22'
-                  log("All registrations returned non-OK — defaulting to 22")
-              # Discover real nodejs path
-              r = curl_get(f"{uapi}/PassengerApps/list_applications")
-              apps_resp = parse(r)
-              nodejs_path = None
-              if isinstance(apps_resp, dict):
-                  apps = apps_resp.get('data', {}) or {}
-                  if isinstance(apps, dict):
-                      apps = apps.get('applications', []) or []
-                  if isinstance(apps, list):
-                      for a in apps:
-                          if isinstance(a, dict) and a.get('name') == app_name:
-                              nodejs_path = (a.get('nodejs_path') or a.get('node_path')
-                                            or a.get('nodejs_binary') or a.get('node_binary'))
-                              log(f"App record: {json.dumps(a)[:400]}")
-                              break
-              if not nodejs_path:
-                  nodejs_path = f"/home/{u}/nodevenv/{domain}/{registered_node}/bin/node"
-                  log(f"Using fallback nodejs_path: {nodejs_path}")
-              else:
-                  log(f"nodejs_path from API: {nodejs_path}")
-              # Write .htaccess
-              htaccess = (
-                  "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n"
-                  "PassengerEnabled On\n"
-                  "PassengerBaseURI /\n"
-                  f"PassengerNodejs {nodejs_path}\n"
-                  f"PassengerAppRoot {app_path}\n"
-                  "PassengerAppType node\n"
-                  "PassengerStartupFile startup.js\n"
-                  "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n"
-              )
-              r = curl_post(
-                  f"{uapi}/Fileman/save_file_content",
-                  {"dir": app_path, "filename": ".htaccess", "content": htaccess}
-              )
-              log(f"save_file_content .htaccess: ok={ok(parse(r))} resp={r[:300]}")
-              # Restart
-              r = curl_get(f"{uapi}/PassengerApps/disable_application?name={app_name}")
+              r = cget(f"{uapi}/PassengerApps/disable_application?name={app_name}")
               log(f"disable: ok={ok(parse(r))}")
               time.sleep(3)
-              r = curl_get(f"{uapi}/PassengerApps/enable_application?name={app_name}")
+              r = cget(f"{uapi}/PassengerApps/enable_application?name={app_name}")
               log(f"enable: ok={ok(parse(r))}")
-              log("waiting 20s for Passenger to start app...")
+              log("waiting 20s...")
               time.sleep(20)
-              # Verify
               try:
-                  r = subprocess.check_output(
-                      ['curl', '-sk', '-i', '--max-time', '15', f'http://{domain}/text-to-leads'],
-                      text=True, timeout=20
-                  )
-                  log(f"--- After fix HTTP ---\n{r[:1000]}")
+                  r = subprocess.check_output(['curl','-sk','-i','--max-time','20',f'http://{domain}/text-to-leads'], text=True, timeout=25)
+                  log(f"--- HTTP after restart ---\n{r[:800]}")
+              except subprocess.CalledProcessError as e:
+                  log(f"HTTP code 28 (timeout): app still hanging")
               except Exception as e:
-                  log(f"HTTP after fix: {e}")
+                  log(f"HTTP err: {e}")
               log("```")
 
-          # ── FIX-SSL ──
           if mode in ('fix-ssl','full-fix'):
-              log("\n## Apply fix-ssl")
+              log("\n## Fix SSL")
               log("```")
-              # Backup .htaccess to .htaccess.passenger then write a minimal one (no Passenger)
-              # so ACME challenge can pass before Passenger intercepts.
-              # Read current .htaccess
-              ht_get = curl_get(f"{uapi}/Fileman/get_file_content?{urllib.parse.urlencode({'dir':app_path,'file':'.htaccess'})}")
-              ht_parsed = parse(ht_get)
-              cur_content = ''
-              if isinstance(ht_parsed, dict):
-                  data = ht_parsed.get('data')
-                  if isinstance(data, dict):
-                      cur_content = data.get('content','')
-              # Save backup
-              r = curl_post(
-                  f"{uapi}/Fileman/save_file_content",
-                  {"dir": app_path, "filename": ".htaccess.passenger.bak", "content": cur_content}
-              )
-              log(f"backup .htaccess: ok={ok(parse(r))}")
-              # Write minimal .htaccess (no Passenger)
-              r = curl_post(
-                  f"{uapi}/Fileman/save_file_content",
-                  {"dir": app_path, "filename": ".htaccess", "content": "Options -Indexes\n"}
-              )
-              log(f"minimal .htaccess: ok={ok(parse(r))}")
-              # Trigger AutoSSL
-              r = curl_get(f"{uapi}/SSL/start_autossl_check_cpanel_domains", timeout=180)
-              log(f"AutoSSL: ok={ok(parse(r))} resp={r[:300]}")
-              # Try LetsEncrypt/install_ssl
-              le_params = urllib.parse.urlencode({"domain": domain})
-              r = curl_get(f"{uapi}/LetsEncrypt/issue?domains[0]={domain}&keytype=prime256v1", timeout=300)
-              log(f"LetsEncrypt issue: ok={ok(parse(r))} resp={r[:500]}")
-              # Wait and verify TLS
-              log("waiting 30s for cert provision...")
-              time.sleep(30)
+              # Backup .htaccess
+              ht_get = cget(f"{uapi}/Fileman/get_file_content?{urllib.parse.urlencode({'dir':app_path,'file':'.htaccess'})}")
+              ht_data = parse(ht_get)
+              cur = ''
+              if isinstance(ht_data, dict) and 'data' in ht_data and isinstance(ht_data['data'], dict):
+                  cur = ht_data['data'].get('content','')
+              if cur:
+                  r = cpost(f"{uapi}/Fileman/save_file_content", {"dir":app_path,"file":".htaccess.passenger.bak","content":cur})
+                  log(f"backup .htaccess: ok={ok(parse(r))}")
+              # Minimal .htaccess for ACME
+              r = cpost(f"{uapi}/Fileman/save_file_content", {"dir":app_path,"file":".htaccess","content":"Options -Indexes\n"})
+              log(f"minimal .htaccess: ok={ok(parse(r))} resp={r[:200]}")
+              # Wait a moment for filesystem
+              time.sleep(2)
+              # Try multiple SSL functions
+              for fn in ['SSL/start_autossl_check', 'SSL/start_autossl_check_cpanel_domains']:
+                  r = cget(f"{uapi}/{fn}", timeout=180)
+                  log(f"{fn}: ok={ok(parse(r))} resp={r[:300]}")
+              # LetsEncrypt - try install_ssl and issue
+              r = cget(f"{uapi}/LetsEncrypt/install_ssl?{urllib.parse.urlencode({'domains[0]':domain,'wildcard':'0'})}", timeout=300)
+              log(f"LetsEncrypt install_ssl: ok={ok(parse(r))} resp={r[:500]}")
+              # Wait for cert
+              log("waiting 45s for SSL to provision...")
+              time.sleep(45)
               # Check cert
               try:
-                  tls = subprocess.run(
-                      ['bash','-c',f'echo | openssl s_client -connect {domain}:443 -servername {domain} 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>&1'],
-                      capture_output=True, text=True, timeout=20
-                  )
-                  log("TLS after SSL fix:\n" + (tls.stdout or '') + (tls.stderr or ''))
+                  tls = subprocess.run(['bash','-c',f'echo | openssl s_client -connect {domain}:443 -servername {domain} 2>/dev/null | openssl x509 -noout -subject -issuer 2>&1'], capture_output=True, text=True, timeout=20)
+                  log(f"TLS:\n{(tls.stdout or '')+(tls.stderr or '')}")
               except Exception as e:
                   log(f"TLS check err: {e}")
-              # Restore Passenger .htaccess if we have a node path
-              if cur_content and 'Passenger' in cur_content:
-                  r = curl_post(
-                      f"{uapi}/Fileman/save_file_content",
-                      {"dir": app_path, "filename": ".htaccess", "content": cur_content}
-                  )
-                  log(f"restore .htaccess: ok={ok(parse(r))}")
-                  # Restart
-                  curl_get(f"{uapi}/PassengerApps/disable_application?name={app_name}")
+              # Restore Passenger .htaccess
+              if cur and 'Passenger' in cur:
+                  r = cpost(f"{uapi}/Fileman/save_file_content", {"dir":app_path,"file":".htaccess","content":cur})
+                  log(f"restore Passenger .htaccess: ok={ok(parse(r))}")
+                  cget(f"{uapi}/PassengerApps/disable_application?name={app_name}")
                   time.sleep(3)
-                  curl_get(f"{uapi}/PassengerApps/enable_application?name={app_name}")
-                  time.sleep(10)
+                  cget(f"{uapi}/PassengerApps/enable_application?name={app_name}")
               log("```")
 
-          # ── Final external check ──
+          # ── Final check ──
           log("\n## Final external check")
           log("```")
-          for url in (f"http://{domain}/text-to-leads", f"https://{domain}/text-to-leads"):
+          for url in (f'http://{domain}/text-to-leads', f'https://{domain}/text-to-leads'):
               try:
-                  r = subprocess.check_output(
-                      ['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code} %{ssl_verify_result}', '--max-time', '15', url],
-                      text=True, timeout=20
-                  )
-                  log(f"{url} → {r}")
+                  r = subprocess.check_output(['curl','-sk','-i','--max-time','20',url], text=True, timeout=25)
+                  log(f"--- {url} ---")
+                  log(r[:1000])
+              except subprocess.CalledProcessError as e:
+                  log(f"{url}: timeout/error (code {e.returncode})")
               except Exception as e:
                   log(f"{url}: {e}")
           log("```")
 
-          # Save to .diag
           stamp = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')
-          content = '\n'.join(out_lines)
+          content = '\n'.join(out)
           os.makedirs('.diag', exist_ok=True)
-          with open('.diag/latest.md','w') as f:
-              f.write(content)
-          with open(f'.diag/{stamp}-{mode}.md','w') as f:
-              f.write(content)
+          open('.diag/latest.md','w').write(content)
+          open(f'.diag/{stamp}-{mode}.md','w').write(content)
           print(f"\nWrote .diag/latest.md ({len(content)} chars)")
           PYEOF
 
-          # Commit and push
           git config user.email "tools-doctor@github-actions"
           git config user.name "tools-doctor"
           git add .diag/
