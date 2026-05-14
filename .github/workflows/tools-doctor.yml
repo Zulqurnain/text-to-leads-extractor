@@ -20,6 +20,11 @@ jobs:
       contents: write
       issues: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
       - name: External probes from runner
         run: |
           set +e
@@ -183,4 +188,52 @@ jobs:
 
             cat "$DIAG"
 
-            python3 -c "import json,urllib.request as u,os,datetime; c=open('$DIAG').read()[:60000]; m=os.environ.get('MODE','diagnose'); t=datetime.datetime.utcnow().strftime('%H:%M'); body=json.dumps({'title':'[tools-doctor:'+m+'] '+t,'body':'\`\`\`\n'+c+'\n\`\`\`\n'}).encode(); req=u.Request('https://api.github.com/repos/Zulqurnain/zulqurnainj.com/issues',data=body,headers={'Authorization':'token '+os.environ['GH_PAT'],'Content-Type':'application/json','User-Agent':'tools-doctor'}); print('ISSUE='+json.loads(u.urlopen(req,timeout=15).read())['html_url'])" 2>&1 || echo "issue_post_failed"
+      - name: SCP diagnostic file from server to runner
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          port: YOUR_SFTP_PORT
+          source: /tmp/diag.txt
+          target: /tmp/server-diag/
+          strip_components: 1
+
+      - name: Commit diagnostic to repo for sandbox readability
+        env:
+          MODE: ${{ inputs.mode || 'fix-passenger' }}
+        run: |
+          set +e
+          mkdir -p .diag
+          STAMP=$(date -u +%Y%m%d-%H%M%S)
+          OUT=".diag/${STAMP}-${MODE}.md"
+          {
+            echo "# tools-doctor diagnostic"
+            echo
+            echo "- timestamp: $(date -u)"
+            echo "- mode: $MODE"
+            echo "- commit: $GITHUB_SHA"
+            echo "- run: https://github.com/Zulqurnain/text-to-leads-extractor/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "## External probe (from runner)"
+            echo
+            echo '```'
+            cat /tmp/probe.txt 2>/dev/null || echo "no probe output"
+            echo '```'
+            echo
+            echo "## Server diagnostic (SSH)"
+            echo
+            echo '```'
+            cat /tmp/server-diag/diag.txt 2>/dev/null || cat /tmp/diag.txt 2>/dev/null || echo "no server diag"
+            echo '```'
+          } > "$OUT"
+          # Also overwrite a "latest" file for easy reading
+          cp "$OUT" .diag/latest.md
+          git config user.email "tools-doctor@github-actions"
+          git config user.name "tools-doctor"
+          git add .diag/
+          git commit -m "diag: ${MODE} @ ${STAMP}" || echo "nothing to commit"
+          git push origin master || echo "push failed"
+          echo "Wrote: $OUT"
+          echo "--- preview ---"
+          head -100 "$OUT"
