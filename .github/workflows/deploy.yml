@@ -94,6 +94,22 @@ jobs:
           with open('.next/standalone/startup.js', 'w') as f:
             f.write(startup)
           print('Wrote startup.js')
+
+          # Write .htaccess for CloudLinux Passenger into the bundle
+          # (uploaded via FTP — more reliable than cPanel Fileman API)
+          htaccess = (
+            '# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n'
+            'PassengerEnabled On\n'
+            'PassengerBaseURI /\n'
+            f'PassengerNodejs /home/{cpanel_user}/nodevenv/tools.zulqurnainj.com/22/bin/node\n'
+            f'PassengerAppRoot /home/{cpanel_user}/tools.zulqurnainj.com\n'
+            'PassengerAppType node\n'
+            'PassengerStartupFile startup.js\n'
+            '# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n'
+          )
+          with open('.next/standalone/.htaccess', 'w') as f:
+            f.write(htaccess)
+          print('Wrote .htaccess')
           PYEOF
 
           mkdir -p .next/standalone/tmp
@@ -121,7 +137,6 @@ jobs:
             mirror --reverse --delete --verbose \
               --exclude .git/ \
               --exclude '.next/cache/' \
-              --exclude .htaccess \
               .next/standalone/ tools.zulqurnainj.com/;
             quit
           "
@@ -234,27 +249,7 @@ jobs:
           else:
               print(f"  Node.js path from API: {nodejs_path}")
 
-          # ── 4. Write .htaccess via cPanel Fileman API ──
-          # This is what cPanel's own "Setup Node.js App" GUI writes.
-          # We do it explicitly so it survives across deploys.
-          htaccess = (
-              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n"
-              "PassengerEnabled On\n"
-              "PassengerBaseURI /\n"
-              f"PassengerNodejs {nodejs_path}\n"
-              f"PassengerAppRoot {app_path}\n"
-              "PassengerAppType node\n"
-              "PassengerStartupFile startup.js\n"
-              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n"
-          )
-          print(f"\n── Writing .htaccess ──\n{htaccess}")
-          r_file = curl_post(
-              f"{uapi}/Fileman/save_file_content",
-              {"dir": app_path, "filename": ".htaccess", "content": htaccess}
-          )
-          print("  .htaccess write:", "OK" if ok(r_file) else f"failed — {r_file[:200]}")
-
-          # ── 5. Restart cycle ──
+          # ── 4. Restart cycle ──
           print("\n── Restart ──")
           curl_get(f"{uapi}/PassengerApps/disable_application?name={app_name}")
           time.sleep(3)
