@@ -1,11 +1,11 @@
-name: Tools Doctor v4 — find node binaries + fix .htaccess
+name: Tools Doctor v5 — try system node paths
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'diagnose | fix-node | fix-ssl'
-        default: 'fix-node'
+        description: 'try-paths | restart-test'
+        default: 'try-paths'
         required: true
   push:
     branches: [master]
@@ -23,13 +23,13 @@ permissions:
 jobs:
   doctor:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Doctor v4
+      - name: Doctor v5
         env:
-          MODE: ${{ inputs.mode || 'fix-node' }}
+          MODE: ${{ inputs.mode || 'try-paths' }}
           CPANEL_HOST: ${{ secrets.CPANEL_HOST }}
           CPANEL_USER: ${{ secrets.CPANEL_USER }}
           CPANEL_PASS: ${{ secrets.CPANEL_PASS }}
@@ -41,7 +41,6 @@ jobs:
           h = os.environ['CPANEL_HOST']
           u = os.environ['CPANEL_USER']
           p = os.environ['CPANEL_PASS']
-          mode = os.environ.get('MODE','fix-node')
           uapi = f"https://{h}:2083/execute"
           domain = "tools.zulqurnainj.com"
           app_name = "tools"
@@ -51,8 +50,7 @@ jobs:
           def log(s): out.append(s); print(s)
 
           def cget(url, timeout=60):
-              try:
-                  return subprocess.check_output(['curl','-sk','-u',f'{u}:{p}',url], text=True, timeout=timeout)
+              try: return subprocess.check_output(['curl','-sk','-u',f'{u}:{p}',url], text=True, timeout=timeout)
               except subprocess.TimeoutExpired: return "TIMEOUT"
               except Exception as e: return f"ERR: {e}"
 
@@ -67,174 +65,147 @@ jobs:
               try:
                   d = json.loads(r)
                   return d.get('result', d) if 'result' in d else d
-              except: return {'_raw': r[:500]}
+              except: return {'_raw': r[:300]}
 
           def ok(parsed): return isinstance(parsed, dict) and parsed.get('status') == 1
 
-          def list_dir(path, types='file|dir'):
-              r = cget(f"{uapi}/Fileman/list_files?{urllib.parse.urlencode({'dir':path,'types':types})}")
-              d = parse(r)
-              if isinstance(d, dict) and 'data' in d and isinstance(d['data'], list):
-                  return d['data']
-              return None
+          def write_htaccess(nodejs_path):
+              content = (
+                  "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n"
+                  "PassengerEnabled On\n"
+                  "PassengerBaseURI /\n"
+                  f"PassengerNodejs {nodejs_path}\n"
+                  f"PassengerAppRoot {app_path}\n"
+                  "PassengerAppType node\n"
+                  "PassengerStartupFile startup.js\n"
+                  "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n"
+              )
+              return cpost(f"{uapi}/Fileman/save_file_content", {"dir":app_path,"file":".htaccess","content":content})
 
-          def file_exists(path):
-              dir_, name = os.path.split(path)
-              files = list_dir(dir_, 'file')
-              if files is None: return False
-              return any(f.get('file') == name for f in files if isinstance(f, dict))
+          def touch_restart():
+              return cpost(f"{uapi}/Fileman/save_file_content", {"dir":app_path+"/tmp","file":"restart.txt","content":str(time.time())})
 
-          log(f"# Doctor v4 — {datetime.datetime.utcnow().isoformat()}Z mode={mode}")
-          log(f"- commit: {os.environ.get('GITHUB_SHA','?')}")
+          def http_check(timeout=20):
+              try:
+                  r = subprocess.check_output(['curl','-sk','-i','-o','-','-w','\\n@@CODE=%{http_code}','--max-time',str(timeout),f'http://{domain}/text-to-leads'], text=True, timeout=timeout+5)
+                  first = r.split('\n')[0].strip()
+                  code = ''
+                  for line in r.split('\n'):
+                      if line.startswith('@@CODE='):
+                          code = line.split('=')[1].strip()
+                  return f"code={code} first={first}", r[:1500]
+              except subprocess.CalledProcessError as e:
+                  return f"curl_err={e.returncode} (28=timeout, 7=connrefused)", ''
+              except Exception as e:
+                  return f"err={e}", ''
+
+          log(f"# Doctor v5 — {datetime.datetime.utcnow().isoformat()}Z mode={os.environ.get('MODE','try-paths')}")
           log(f"- run: https://github.com/Zulqurnain/text-to-leads-extractor/actions/runs/{os.environ.get('GITHUB_RUN_ID','?')}")
 
-          # ── Find all node binaries on the system ──
-          log("\n## Searching for node binaries")
+          # ── Try ensure_deps_are_installed (might surface node path) ──
+          log("\n## PassengerApps.ensure_deps_are_installed")
           log("```")
-          # Try nodevenv subdirs
-          log("--- ~/nodevenv ---")
-          nv = list_dir(f"/home/{u}/nodevenv", 'dir')
-          if nv:
-              for d in nv:
-                  if isinstance(d, dict):
-                      log(f"  {d.get('file')}")
-                      # List subdirs of each
-                      sub = list_dir(f"/home/{u}/nodevenv/{d.get('file')}", 'dir')
-                      if sub:
-                          for s in sub[:10]:
-                              if isinstance(s, dict):
-                                  ver_path = f"/home/{u}/nodevenv/{d.get('file')}/{s.get('file')}"
-                                  bin_path = f"{ver_path}/bin/node"
-                                  exists = file_exists(bin_path)
-                                  log(f"    {s.get('file')} (node binary: {'YES' if exists else 'no'} — {bin_path})")
-          else:
-              log("  ~/nodevenv: list failed")
-          # Try EasyApache node binaries
-          log("\n--- /opt/cpanel ea-nodejs ---")
-          for v in (18, 20, 22, 24):
-              for prefix in (f'/opt/cpanel/ea-nodejs{v}', f'/opt/alt/alt-nodejs{v}/root/usr'):
-                  path = f"{prefix}/bin"
-                  files = list_dir(path, 'file')
-                  if files is not None:
-                      for f in files:
-                          if isinstance(f, dict) and f.get('file') == 'node':
-                              log(f"  FOUND: {prefix}/bin/node")
+          r = cget(f"{uapi}/PassengerApps/ensure_deps_are_installed?name={app_name}", timeout=120)
+          log(json.dumps(parse(r), indent=2)[:1500])
           log("```")
 
-          # ── Try cPanel NodeJS module for available versions ──
-          log("\n## cPanel NodeJS UAPI module")
+          # ── Try get a few node paths via Fileman/get_file_content ──
+          # Even if list fails, get on a file should report if file exists
+          log("\n## Probing node binary paths (via get_file_content)")
           log("```")
-          # Some cPanel installs expose `NodeJS/list_available_versions`
-          for fn in ['NodeJS/list_available_versions', 'CloudLinuxNodeJS/list_versions',
-                     'PassengerApps/list_supported_app_types']:
-              r = cget(f"{uapi}/{fn}")
-              log(f"--- {fn} ---")
-              log(json.dumps(parse(r), indent=2)[:600])
-          log("```")
-
-          # ── Probe what's actually working for node ──
-          log("\n## Probe: which nodevenv dirs exist for ANY domain")
-          log("```")
-          # List all nodevenv subdirs
-          if nv:
-              for d in nv:
-                  if isinstance(d, dict):
-                      name = d.get('file')
-                      sub = list_dir(f"/home/{u}/nodevenv/{name}")
-                      if sub:
-                          for s in sub:
-                              if isinstance(s, dict):
-                                  v = s.get('file')
-                                  bin_dir = list_dir(f"/home/{u}/nodevenv/{name}/{v}/bin", 'file')
-                                  if bin_dir:
-                                      has_node = any(b.get('file') == 'node' for b in bin_dir if isinstance(b, dict))
-                                      if has_node:
-                                          log(f"  WORKING: /home/{u}/nodevenv/{name}/{v}/bin/node")
-          log("```")
-
-          # ── Current .htaccess ──
-          log("\n## Current .htaccess")
-          log("```")
-          r = cget(f"{uapi}/Fileman/get_file_content?{urllib.parse.urlencode({'dir':app_path,'file':'.htaccess'})}")
-          d = parse(r)
-          if isinstance(d, dict) and 'data' in d and isinstance(d['data'], dict):
-              log(d['data'].get('content',''))
-          log("```")
-
-          # ── ACTIONS ──
-          if mode == 'fix-node':
-              # Find any working node binary, fall back to system if no nodevenv
-              log("\n## Apply fix-node")
-              log("```")
-              working_node = None
-              # Check ~/nodevenv/tools.zulqurnainj.com/ versions
-              for v in (22, 20, 18, 24):
-                  bin_path = f"/home/{u}/nodevenv/{domain}/{v}/bin/node"
-                  if file_exists(bin_path):
-                      working_node = bin_path
-                      log(f"Found nodevenv node: {bin_path}")
-                      break
-              # Try other nodevenvs (any domain)
-              if not working_node and nv:
-                  for d in nv:
-                      if isinstance(d, dict):
-                          name = d.get('file')
-                          sub = list_dir(f"/home/{u}/nodevenv/{name}")
-                          if sub:
-                              for s in sub:
-                                  if isinstance(s, dict):
-                                      v = s.get('file')
-                                      bp = f"/home/{u}/nodevenv/{name}/{v}/bin/node"
-                                      if file_exists(bp):
-                                          working_node = bp
-                                          log(f"Borrowing from other domain: {bp}")
-                                          break
-                              if working_node: break
-              # System node
-              if not working_node:
-                  for path in ['/opt/cpanel/ea-nodejs22/bin/node','/opt/cpanel/ea-nodejs20/bin/node',
-                               '/opt/cpanel/ea-nodejs18/bin/node','/opt/alt/alt-nodejs22/root/usr/bin/node',
-                               '/opt/alt/alt-nodejs20/root/usr/bin/node']:
-                      if file_exists(path):
-                          working_node = path
-                          log(f"Using system node: {path}")
-                          break
-              if not working_node:
-                  log("NO NODE FOUND — cannot fix")
+          candidates = [
+              "/opt/cpanel/ea-nodejs22/bin/node",
+              "/opt/cpanel/ea-nodejs20/bin/node",
+              "/opt/cpanel/ea-nodejs18/bin/node",
+              "/opt/alt/alt-nodejs22/root/usr/bin/node",
+              "/opt/alt/alt-nodejs20/root/usr/bin/node",
+              "/opt/alt/alt-nodejs18/root/usr/bin/node",
+              "/usr/local/bin/node",
+              "/usr/bin/node",
+              "/opt/cpanel/ea-nodejs/bin/node",
+              "/usr/local/cpanel/3rdparty/bin/node",
+          ]
+          for cand in candidates:
+              dir_ = os.path.dirname(cand)
+              name = os.path.basename(cand)
+              # Try Fileman/stat_dir or get_file_metadata
+              r = cget(f"{uapi}/Fileman/get_file_information?{urllib.parse.urlencode({'path':cand})}")
+              d = parse(r)
+              if ok(d):
+                  log(f"  ✓ {cand} (stat ok)")
               else:
-                  htaccess = (
-                      "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n"
-                      "PassengerEnabled On\n"
-                      "PassengerBaseURI /\n"
-                      f"PassengerNodejs {working_node}\n"
-                      f"PassengerAppRoot {app_path}\n"
-                      "PassengerAppType node\n"
-                      "PassengerStartupFile startup.js\n"
-                      "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n"
-                  )
-                  log(f"Writing .htaccess with PassengerNodejs = {working_node}")
-                  r = cpost(f"{uapi}/Fileman/save_file_content", {"dir":app_path,"file":".htaccess","content":htaccess})
-                  log(f"save_file_content: ok={ok(parse(r))} resp={r[:300]}")
-                  # Touch restart
-                  r = cpost(f"{uapi}/Fileman/save_file_content", {"dir":app_path+"/tmp","file":"restart.txt","content":str(datetime.datetime.utcnow())})
-                  log(f"touch tmp/restart.txt: ok={ok(parse(r))}")
-                  # Restart
+                  # Fallback: try get_file_content with small read
+                  err = d.get('errors', ['?'])[0] if isinstance(d, dict) and d.get('errors') else 'unknown'
+                  log(f"  ✗ {cand} ({err[:100]})")
+          log("```")
+
+          # ── Try via Cron module to list /opt/cpanel ──
+          log("\n## Cron probe")
+          log("```")
+          r = cget(f"{uapi}/Cron/list_lines")
+          log(json.dumps(parse(r), indent=2)[:500])
+          log("```")
+
+          # ── Read Apache vhost config to understand setup ──
+          log("\n## Looking for Apache included confs in user home")
+          log("```")
+          r = cget(f"{uapi}/Fileman/list_files?{urllib.parse.urlencode({'dir':f'/home/{u}','types':'dir'})}")
+          d = parse(r)
+          if isinstance(d, dict) and 'data' in d:
+              for f in (d['data'] or [])[:40]:
+                  if isinstance(f, dict):
+                      log(f"  {f.get('file')}")
+          log("```")
+
+          # ── Try various PassengerNodejs values and check response ──
+          if os.environ.get('MODE') == 'try-paths':
+              log("\n## Trying each node path in .htaccess and probing response")
+              log("```")
+              test_paths = [
+                  "/opt/cpanel/ea-nodejs22/bin/node",
+                  "/opt/cpanel/ea-nodejs20/bin/node",
+                  "/opt/cpanel/ea-nodejs18/bin/node",
+                  "/opt/alt/alt-nodejs22/root/usr/bin/node",
+                  "/opt/alt/alt-nodejs20/root/usr/bin/node",
+                  "/opt/alt/alt-nodejs18/root/usr/bin/node",
+                  "/usr/local/bin/node",
+                  "/usr/bin/node",
+              ]
+              best = None
+              for path in test_paths:
+                  log(f"\n--- Trying PassengerNodejs={path} ---")
+                  r = write_htaccess(path)
+                  log(f"  write .htaccess ok={ok(parse(r))}")
+                  touch_restart()
+                  # Need to disable+enable for full restart
+                  cget(f"{uapi}/PassengerApps/disable_application?name={app_name}")
+                  time.sleep(2)
+                  r = cget(f"{uapi}/PassengerApps/enable_application?name={app_name}")
+                  log(f"  enable ok={ok(parse(r))}")
+                  # Wait less per try
+                  time.sleep(10)
+                  status, body = http_check(timeout=10)
+                  log(f"  result: {status}")
+                  if 'code=200' in status or 'code=301' in status or 'code=302' in status or 'code=404' in status or 'code=500' in status:
+                      # Got a response (not a timeout)
+                      log(f"  *** GOT RESPONSE from {path}! ***")
+                      log(f"  body:\n{body[:800]}")
+                      best = path
+                      break
+              if best:
+                  log(f"\n  ✓ WORKING node binary: {best}")
+                  # Final verify with full restart
                   cget(f"{uapi}/PassengerApps/disable_application?name={app_name}")
                   time.sleep(3)
-                  r = cget(f"{uapi}/PassengerApps/enable_application?name={app_name}")
-                  log(f"enable: ok={ok(parse(r))}")
-                  log("Waiting 20s...")
+                  cget(f"{uapi}/PassengerApps/enable_application?name={app_name}")
                   time.sleep(20)
-                  try:
-                      r = subprocess.check_output(['curl','-sk','-i','--max-time','20',f'http://{domain}/text-to-leads'], text=True, timeout=25)
-                      log(f"--- HTTP after fix ---\n{r[:1000]}")
-                  except subprocess.CalledProcessError as e:
-                      log(f"HTTP still failing: code {e.returncode}")
-                  except Exception as e:
-                      log(f"HTTP err: {e}")
+                  status, body = http_check(timeout=20)
+                  log(f"  Final check (20s wait): {status}")
+              else:
+                  log("\n  ✗ No node path worked — ALL timed out")
               log("```")
 
-          # ── Final check ──
+          # ── Final ──
           log("\n## Final external check")
           log("```")
           for url in (f'http://{domain}/text-to-leads', f'https://{domain}/text-to-leads'):
@@ -249,12 +220,12 @@ jobs:
           content = '\n'.join(out)
           os.makedirs('.diag', exist_ok=True)
           open('.diag/latest.md','w').write(content)
-          open(f'.diag/{stamp}-{mode}.md','w').write(content)
+          open(f'.diag/{stamp}-v5.md','w').write(content)
           print(f"\nWrote .diag/latest.md ({len(content)} chars)")
           PYEOF
 
           git config user.email "tools-doctor@github-actions"
           git config user.name "tools-doctor"
           git add .diag/
-          git commit -m "diag [skip ci]: ${MODE} @ $(date -u +%Y%m%d-%H%M%S)" || echo "nothing to commit"
+          git commit -m "diag [skip ci]: v5 try-paths @ $(date -u +%Y%m%d-%H%M%S)" || echo "nothing to commit"
           git push origin master 2>&1 | tail -5 || echo "push failed"
