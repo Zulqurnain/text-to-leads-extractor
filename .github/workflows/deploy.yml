@@ -20,6 +20,8 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Download node-llama-cpp pre-built binaries
+        continue-on-error: true
+        timeout-minutes: 10
         run: node node_modules/node-llama-cpp/dist/cli/cli.js postinstall
 
       - name: Build (standalone)
@@ -44,7 +46,7 @@ jobs:
           cp -r node_modules/node-llama-cpp .next/standalone/node_modules/
           cp -r node_modules/pdf-parse .next/standalone/node_modules/
           # Copy offllama's runtime deps too
-          for dep in lifecycle-utils; do
+          for dep in lifecycle-utils express commander; do
             [ -d "node_modules/$dep" ] && cp -r "node_modules/$dep" .next/standalone/node_modules/
           done
 
