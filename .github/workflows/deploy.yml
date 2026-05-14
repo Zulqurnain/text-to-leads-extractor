@@ -117,7 +117,7 @@ jobs:
           FTP_PASS: ${{ secrets.FTP_PASSWORD }}
           FTP_HOST: ${{ secrets.FTP_SERVER }}
         run: |
-          lftp -d -c "
+          lftp -c "
             set ftp:ssl-allow yes;
             set ftp:ssl-force no;
             set ssl:verify-certificate no;
@@ -131,7 +131,8 @@ jobs:
               --exclude .git/ --exclude '.next/cache/' \
               .next/standalone/ tools.zulqurnainj.com/;
             quit
-          " 2>&1 | tail -50
+          "
+          echo "FTP upload complete — exit $?"
 
       - name: Register/update Passenger app and provision SSL
         env:
@@ -178,23 +179,30 @@ jobs:
           else:
               print("  Subdomain already exists or non-fatal error — continuing")
 
-          # ── 1. Register app (creates it if missing, harmless if it already exists) ──
+          # ── 1. Register app — try Node versions until one is accepted ──
           print("\n── Registering Passenger app ──")
-          reg_params = urllib.parse.urlencode({
-              "name":             app_name,
-              "path":             f"/home/{u}/{domain}",
-              "domain":           domain,
-              "base_uri":         "/",
-              "startup_file":     "startup.js",
-              "app_type":         "node",
-              "node_version":     "22",
-              "deployment_mode":  "production",
-          })
-          r_reg = curl(f"{uapi}/PassengerApps/register_application?{reg_params}")
-          if uapi_ok(r_reg):
-              print("  App registered OK")
-          else:
-              print("  Register returned non-OK (app may already exist — continuing)")
+          registered_node = None
+          for node_ver in ("22", "20", "18"):
+              reg_params = urllib.parse.urlencode({
+                  "name":             app_name,
+                  "path":             f"/home/{u}/{domain}",
+                  "domain":           domain,
+                  "base_uri":         "/",
+                  "startup_file":     "startup.js",
+                  "app_type":         "node",
+                  "node_version":     node_ver,
+                  "deployment_mode":  "production",
+              })
+              r_reg = curl(f"{uapi}/PassengerApps/register_application?{reg_params}")
+              if uapi_ok(r_reg):
+                  print(f"  App registered OK with Node.js {node_ver}")
+                  registered_node = node_ver
+                  break
+              else:
+                  print(f"  Node.js {node_ver} not accepted or app already exists — trying next")
+          if not registered_node:
+              print("  App already registered or registration failed — will update")
+              registered_node = "22"
 
           # ── 2. Update to ensure correct settings ──
           print("\n── Updating app settings ──")
@@ -202,7 +210,7 @@ jobs:
               "name":             app_name,
               "startup_file":     "startup.js",
               "app_type":         "node",
-              "node_version":     "22",
+              "node_version":     registered_node,
               "deployment_mode":  "production",
           })
           r_upd = curl(f"{uapi}/PassengerApps/update_application?{upd_params}")
@@ -210,11 +218,13 @@ jobs:
 
           # ── 3. Restart cycle ──
           print("\n── Restarting app ──")
-          curl(f"{uapi}/PassengerApps/ensure_application_has_started?name={app_name}")
           curl(f"{uapi}/PassengerApps/disable_application?name={app_name}")
-          time.sleep(3)
+          time.sleep(2)
           r_en = curl(f"{uapi}/PassengerApps/enable_application?name={app_name}")
           print("  Enable:", "OK" if uapi_ok(r_en) else "failed")
+          # Give Passenger time to spawn the process before ACME challenge
+          print("  Waiting 15s for app to start...")
+          time.sleep(15)
 
           # ── 4. Provision SSL ──
           # Try Let's Encrypt UAPI first, fall back to AutoSSL trigger
