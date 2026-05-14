@@ -5,8 +5,13 @@ on:
     inputs:
       mode:
         description: 'diagnose | fix-passenger | fix-ssl | restart-only'
-        default: 'diagnose'
+        default: 'fix-passenger'
         required: true
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/tools-doctor.yml'
+      - '.github/doctor-trigger'
 
 jobs:
   doctor:
@@ -18,8 +23,9 @@ jobs:
       - name: External probes from runner
         run: |
           set +e
+          MODE="${{ inputs.mode || 'fix-passenger' }}"
           {
-            echo "=== Mode: ${{ inputs.mode }}  |  $(date -u) ==="
+            echo "=== Mode: $MODE  |  $(date -u) ==="
             echo "--- DNS ---"; getent ahosts tools.zulqurnainj.com; getent ahosts zulqurnainj.com
             echo "--- HTTP /text-to-leads ---"
             curl -sk -i --max-time 15 http://tools.zulqurnainj.com/text-to-leads 2>&1 | head -25
@@ -38,7 +44,7 @@ jobs:
         uses: appleboy/ssh-action@v1.0.3
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
-          MODE: ${{ inputs.mode }}
+          MODE: ${{ inputs.mode || 'fix-passenger' }}
         with:
           host: ${{ secrets.FTP_SERVER }}
           username: ${{ secrets.FTP_USERNAME }}
