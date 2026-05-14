@@ -1,0 +1,29 @@
+name: Test GITHUB_TOKEN pushback
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/test-pushback.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Try push
+        run: |
+          mkdir -p .diag
+          echo "test run $(date -u)" > .diag/test.txt
+          git config user.email "test-pushback@github-actions"
+          git config user.name "test-pushback"
+          git add .diag/test.txt
+          git commit -m "test [skip ci]: pushback test $(date -u +%H%M%S)" || echo "nothing to commit"
+          echo "--- Trying git push ---"
+          git push origin master && echo "PUSH OK" || echo "PUSH FAILED"
