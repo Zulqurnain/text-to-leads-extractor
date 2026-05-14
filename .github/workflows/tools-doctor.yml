@@ -1,0 +1,180 @@
+name: Tools Doctor — diagnose tools.zulqurnainj.com
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'diagnose | fix-passenger | fix-ssl | restart-only'
+        default: 'diagnose'
+        required: true
+
+jobs:
+  doctor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: External probes from runner
+        run: |
+          set +e
+          {
+            echo "=== Mode: ${{ inputs.mode }}  |  $(date -u) ==="
+            echo "--- DNS ---"; getent ahosts tools.zulqurnainj.com; getent ahosts zulqurnainj.com
+            echo "--- HTTP /text-to-leads ---"
+            curl -sk -i --max-time 15 http://tools.zulqurnainj.com/text-to-leads 2>&1 | head -25
+            echo "--- HTTPS /text-to-leads ---"
+            curl -sk -i --max-time 15 https://tools.zulqurnainj.com/text-to-leads 2>&1 | head -25
+            echo "--- TLS cert ---"
+            echo | openssl s_client -connect tools.zulqurnainj.com:443 -servername tools.zulqurnainj.com 2>/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>&1
+            echo "--- ACME path ---"
+            curl -sk -i --max-time 10 http://tools.zulqurnainj.com/.well-known/acme-challenge/preflight 2>&1 | head -10
+            echo "--- Portfolio HTTPS ---"
+            curl -sk -o /dev/null -w 'HTTPS zulqurnainj.com: %{http_code}\n' --max-time 15 https://zulqurnainj.com/
+            curl -sk -o /dev/null -w 'HTTPS /saas/: %{http_code}\n' --max-time 15 https://zulqurnainj.com/saas/
+          } | tee /tmp/probe.txt
+
+      - name: SSH diagnose / fix
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          MODE: ${{ inputs.mode }}
+        with:
+          host: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          port: YOUR_SFTP_PORT
+          envs: GH_PAT,MODE
+          command_timeout: 15m
+          script: |
+            set +e
+            APPDIR=$HOME/tools.zulqurnainj.com
+            DIAG=/tmp/diag.txt
+            : > "$DIAG"
+            (
+              echo "=== SERVER DIAG ($(date -u))  mode=$MODE ==="
+              whoami; hostname; pwd; echo "HOME=$HOME"
+              echo "--- $APPDIR listing ---"
+              ls -la "$APPDIR/" 2>&1 | head -40
+              echo "--- .htaccess ---"
+              cat "$APPDIR/.htaccess" 2>&1 || echo "no .htaccess"
+              echo "--- startup.js (first 30 lines) ---"
+              head -30 "$APPDIR/startup.js" 2>&1 || echo "missing"
+              echo "--- server.js ---"
+              ls -la "$APPDIR/server.js" 2>&1
+              echo "--- .env (sanitized) ---"
+              grep -vi 'PASS\|SECRET\|KEY' "$APPDIR/.env" 2>&1 | head -30
+              echo "--- nodevenv dirs ---"
+              ls -la $HOME/nodevenv/ 2>&1 | head
+              ls -la $HOME/nodevenv/tools.zulqurnainj.com/ 2>&1 | head
+              for v in 18 20 22 24; do
+                NB=$HOME/nodevenv/tools.zulqurnainj.com/$v/bin/node
+                if [ -x "$NB" ]; then echo "  OK node $v: $NB"; else echo "  -- node $v: missing"; fi
+              done
+              echo "--- Passenger UAPI list_applications ---"
+              uapi PassengerApps list_applications 2>&1 | head -80
+              echo "--- Server-local HTTP self-check ---"
+              curl -sk -i --max-time 10 -H 'Host: tools.zulqurnainj.com' http://127.0.0.1/text-to-leads 2>&1 | head -20
+              echo "--- Server-side public HTTP ---"
+              curl -sk -i --max-time 10 http://tools.zulqurnainj.com/text-to-leads 2>&1 | head -20
+              echo "--- Error logs ---"
+              for L in $HOME/logs/tools.zulqurnainj.com.error.log $HOME/logs/error_log $HOME/error_log /usr/local/apache/logs/error_log; do
+                if [ -r "$L" ]; then echo "=== $L ==="; tail -30 "$L"; fi
+              done
+              echo "--- Passenger logs ---"
+              for L in $HOME/logs/passenger.log $HOME/.passenger/passenger.log; do
+                if [ -r "$L" ]; then echo "=== $L ==="; tail -30 "$L"; fi
+              done
+            ) >> "$DIAG" 2>&1
+
+            NB=""
+            NV=""
+            for v in 22 20 18 24; do
+              if [ -x $HOME/nodevenv/tools.zulqurnainj.com/$v/bin/node ]; then
+                NB=$HOME/nodevenv/tools.zulqurnainj.com/$v/bin/node
+                NV=$v
+                break
+              fi
+            done
+
+            if [ "$MODE" = "fix-passenger" ] || [ "$MODE" = "fix-ssl" ]; then
+              (
+                echo
+                echo "=== APPLYING FIX (mode=$MODE) ==="
+                if [ -n "$NB" ]; then echo "using node $NV: $NB"; else echo "no nodevenv; registering"; fi
+              ) >> "$DIAG" 2>&1
+              if [ -z "$NB" ]; then
+                uapi PassengerApps register_application name=tools path=$APPDIR domain=tools.zulqurnainj.com base_uri=/ startup_file=startup.js app_type=node node_version=22 deployment_mode=production >> "$DIAG" 2>&1
+                sleep 8
+                for v in 22 20 18; do
+                  if [ -x $HOME/nodevenv/tools.zulqurnainj.com/$v/bin/node ]; then
+                    NB=$HOME/nodevenv/tools.zulqurnainj.com/$v/bin/node
+                    NV=$v
+                    echo "have node $v now" >> "$DIAG"
+                    break
+                  fi
+                done
+              fi
+            fi
+
+            if [ "$MODE" = "fix-ssl" ]; then
+              (
+                echo
+                echo "=== SSL FIX ==="
+                cp "$APPDIR/.htaccess" "$APPDIR/.htaccess.bak.$(date +%s)" 2>/dev/null
+                printf 'Options -Indexes\n' > "$APPDIR/.htaccess"
+                mkdir -p "$APPDIR/.well-known/acme-challenge/"
+                echo PROBE > "$APPDIR/.well-known/acme-challenge/probe"
+                echo "--- ACME probe ---"
+                curl -sv --max-time 8 http://tools.zulqurnainj.com/.well-known/acme-challenge/probe 2>&1 | head -10
+                rm -f "$APPDIR/.well-known/acme-challenge/probe"
+                uapi HTTP disable_force_https domain=tools.zulqurnainj.com 2>&1 | head -10
+                uapi HTTP update_always_redirect domain=tools.zulqurnainj.com redirect_to_ssl=0 2>&1 | head -10
+                echo "--- AutoSSL ---"
+                uapi SSL start_autossl_check_cpanel_domains 2>&1 | head -20
+                echo "--- LetsEncrypt install_ssl ---"
+                uapi LetsEncrypt install_ssl domains='[{"domain":"tools.zulqurnainj.com","wildcard":false}]' 2>&1 | head -40
+              ) >> "$DIAG" 2>&1
+            fi
+
+            if [ "$MODE" = "fix-passenger" ] && [ -n "$NB" ]; then
+              HT="$APPDIR/.htaccess"
+              printf '# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n' >  "$HT"
+              printf 'PassengerEnabled On\n'                                          >> "$HT"
+              printf 'PassengerBaseURI /\n'                                           >> "$HT"
+              printf 'PassengerNodejs %s\n' "$NB"                                     >> "$HT"
+              printf 'PassengerAppRoot %s\n' "$APPDIR"                                >> "$HT"
+              printf 'PassengerAppType node\n'                                        >> "$HT"
+              printf 'PassengerStartupFile startup.js\n'                              >> "$HT"
+              printf '# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n'      >> "$HT"
+              (
+                echo
+                echo "=== PASSENGER FIX ==="
+                echo "Wrote .htaccess:"
+                cat "$HT"
+                mkdir -p "$APPDIR/tmp"; date > "$APPDIR/tmp/restart.txt"
+                uapi PassengerApps disable_application name=tools 2>&1 | head -5
+                sleep 3
+                uapi PassengerApps enable_application name=tools 2>&1 | head -5
+                sleep 15
+                echo "--- Post-restart self-check ---"
+                curl -sk -i --max-time 10 http://tools.zulqurnainj.com/text-to-leads 2>&1 | head -15
+              ) >> "$DIAG" 2>&1
+            fi
+
+            if [ "$MODE" = "restart-only" ]; then
+              (
+                echo
+                echo "=== RESTART ONLY ==="
+                mkdir -p "$APPDIR/tmp"; date > "$APPDIR/tmp/restart.txt"
+                uapi PassengerApps disable_application name=tools 2>&1 | head -5
+                sleep 3
+                uapi PassengerApps enable_application name=tools 2>&1 | head -5
+                sleep 15
+                curl -sk -i --max-time 10 http://tools.zulqurnainj.com/text-to-leads 2>&1 | head -15
+              ) >> "$DIAG" 2>&1
+            fi
+
+            cat "$DIAG"
+
+            python3 -c "import json,urllib.request as u,os,datetime; c=open('$DIAG').read()[:60000]; m=os.environ.get('MODE','diagnose'); t=datetime.datetime.utcnow().strftime('%H:%M'); body=json.dumps({'title':'[tools-doctor:'+m+'] '+t,'body':'\`\`\`\n'+c+'\n\`\`\`\n'}).encode(); req=u.Request('https://api.github.com/repos/Zulqurnain/zulqurnainj.com/issues',data=body,headers={'Authorization':'token '+os.environ['GH_PAT'],'Content-Type':'application/json','User-Agent':'tools-doctor'}); print('ISSUE='+json.loads(u.urlopen(req,timeout=15).read())['html_url'])" 2>&1 || echo "issue_post_failed"
