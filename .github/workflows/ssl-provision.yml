@@ -1,0 +1,207 @@
+name: SSL Provision
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/ssl-trigger.txt'
+
+concurrency:
+  group: ssl-provision
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  ssl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check current cert and issue if invalid
+        env:
+          CPANEL_HOST: ${{ secrets.CPANEL_HOST }}
+          CPANEL_USER: ${{ secrets.CPANEL_USER }}
+          CPANEL_PASS: ${{ secrets.CPANEL_PASS }}
+        run: |
+          python3 << 'PYEOF'
+          import os, subprocess, json, urllib.parse, time, datetime, ssl, socket
+
+          h = os.environ['CPANEL_HOST']
+          u = os.environ['CPANEL_USER']
+          p = os.environ['CPANEL_PASS']
+          uapi = f"https://{h}:2083/execute"
+          domain = "tools.zulqurnainj.com"
+          app_name = "tools"
+          app_path = f"/home/{u}/{domain}"
+          NODEJS_BIN = "/opt/alt/alt-nodejs22/root/usr/bin/node"
+
+          out = []
+          def log(s): out.append(s); print(s)
+
+          def cget(url, timeout=60):
+              try: return subprocess.check_output(['curl','-sk','-u',f'{u}:{p}',url], text=True, timeout=timeout)
+              except Exception as e: return f"ERR: {e}"
+
+          def cpost(url, data, timeout=60):
+              cmd = ['curl','-sk','-u',f'{u}:{p}','-X','POST']
+              for k,v in data.items(): cmd += ['--data-urlencode', f'{k}={v}']
+              cmd.append(url)
+              try: return subprocess.check_output(cmd, text=True, timeout=timeout)
+              except Exception as e: return f"ERR: {e}"
+
+          def parse(r):
+              try:
+                  d = json.loads(r)
+                  return d.get('result', d) if 'result' in d else d
+              except: return {'_raw': r[:300]}
+
+          def ok(p): return isinstance(p, dict) and p.get('status') == 1
+
+          def get_cert_subject(host):
+              try:
+                  ctx = ssl.create_default_context()
+                  ctx.check_hostname = False
+                  ctx.verify_mode = ssl.CERT_NONE
+                  with socket.create_connection((host, 443), timeout=10) as sock:
+                      with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                          cert = ssock.getpeercert(binary_form=True)
+                          import ssl as ssl_m
+                          der = cert
+                          # Parse via openssl x509
+                          p = subprocess.run(['openssl','x509','-inform','DER','-noout','-subject','-issuer','-dates'],
+                                            input=der, capture_output=True, timeout=10)
+                          return p.stdout.decode('utf-8', errors='ignore')
+              except Exception as e:
+                  return f"ERR: {e}"
+
+          log(f"# SSL Provision — {datetime.datetime.utcnow().isoformat()}Z")
+          log(f"- run: https://github.com/Zulqurnain/text-to-leads-extractor/actions/runs/{os.environ.get('GITHUB_RUN_ID','?')}")
+
+          # ── Current cert ──
+          log("\n## Current cert BEFORE")
+          log("```")
+          log(get_cert_subject(domain))
+          log("```")
+
+          # ── List installed certs via UAPI ──
+          log("\n## SSL/installed_hosts")
+          log("```")
+          r = cget(f"{uapi}/SSL/installed_hosts")
+          d = parse(r)
+          if isinstance(d, dict) and 'data' in d:
+              for host in (d.get('data') or []):
+                  if isinstance(host, dict):
+                      log(f"  domain={host.get('domain')} issuer.organizationName={host.get('issuer.organizationName')} fqdns={host.get('fqdns')}")
+          else:
+              log(json.dumps(d, indent=2)[:1000])
+          log("```")
+
+          # ── Disable Passenger temporarily for ACME challenge ──
+          log("\n## Disable Passenger for ACME challenge")
+          log("```")
+          r_dis = cget(f"{uapi}/PassengerApps/disable_application?name={app_name}")
+          log(f"disable ok={ok(parse(r_dis))}")
+          acme_ht = "Options -Indexes\n"
+          r_ht = cpost(f"{uapi}/Fileman/save_file_content",
+                      {"dir": app_path, "file": ".htaccess", "content": acme_ht})
+          log(f"minimal .htaccess ok={ok(parse(r_ht))}")
+          # Create .well-known/acme-challenge for challenge files
+          r_mk = cpost(f"{uapi}/Fileman/mkdir",
+                      {"path": app_path + "/.well-known", "name": "acme-challenge"})
+          log(f"mkdir acme-challenge: {parse(r_mk).get('status')}")
+          time.sleep(5)
+          log("```")
+
+          # ── Try LetsEncrypt issue ──
+          log("\n## LetsEncrypt/issue")
+          log("```")
+          params = urllib.parse.urlencode({"domains": domain, "keytype": "prime256v1"})
+          r_le = cget(f"{uapi}/LetsEncrypt/issue?{params}", timeout=240)
+          d = parse(r_le)
+          log(f"ok={ok(d)}")
+          log(json.dumps(d, indent=2)[:1500])
+          log("```")
+
+          # ── If LE failed, try install_ssl from existing cert pool ──
+          if not ok(parse(r_le)):
+              log("\n## SSL/start_autossl_check")
+              log("```")
+              r_auto = cget(f"{uapi}/SSL/start_autossl_check", timeout=120)
+              log(json.dumps(parse(r_auto), indent=2)[:800])
+              log("```")
+              log("Waiting 60s for AutoSSL...")
+              time.sleep(60)
+
+          time.sleep(20)
+
+          # ── Restore Passenger config ──
+          log("\n## Restore Passenger config")
+          log("```")
+          htaccess = (
+              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n"
+              "PassengerEnabled On\n"
+              "PassengerBaseURI /\n"
+              f"PassengerNodejs {NODEJS_BIN}\n"
+              f"PassengerAppRoot {app_path}\n"
+              "PassengerAppType node\n"
+              "PassengerStartupFile startup.js\n"
+              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n"
+          )
+          r_ht2 = cpost(f"{uapi}/Fileman/save_file_content",
+                      {"dir": app_path, "file": ".htaccess", "content": htaccess})
+          log(f"restore .htaccess ok={ok(parse(r_ht2))}")
+          r_en = cget(f"{uapi}/PassengerApps/enable_application?name={app_name}")
+          log(f"enable ok={ok(parse(r_en))}")
+          # Touch restart
+          cpost(f"{uapi}/Fileman/save_file_content",
+                {"dir": app_path + "/tmp", "file": "restart.txt", "content": str(time.time())})
+          log("```")
+          time.sleep(20)
+
+          # ── Verify cert ──
+          log("\n## Current cert AFTER")
+          log("```")
+          log(get_cert_subject(domain))
+          log("```")
+
+          # ── Final HTTP/HTTPS check ──
+          log("\n## Final checks")
+          log("```")
+          for scheme in ('http', 'https'):
+              try:
+                  code = subprocess.check_output(
+                      ['curl','-s','-o','/dev/null','-w','%{http_code}','--max-time','20',
+                       f'{scheme}://{domain}/text-to-leads'],
+                      text=True, timeout=25
+                  )
+                  log(f"  {scheme} (verify): code={code}")
+              except subprocess.CalledProcessError as e:
+                  log(f"  {scheme} (verify): err={e.returncode} (60=cert invalid)")
+              try:
+                  code = subprocess.check_output(
+                      ['curl','-sk','-o','/dev/null','-w','%{http_code}','--max-time','20',
+                       f'{scheme}://{domain}/text-to-leads'],
+                      text=True, timeout=25
+                  )
+                  log(f"  {scheme} (insecure): code={code}")
+              except Exception as e:
+                  log(f"  {scheme} (insecure): err={e}")
+          log("```")
+
+          os.makedirs('.diag', exist_ok=True)
+          content = '\n'.join(out)
+          open('.diag/ssl-status.md', 'w').write(content)
+          stamp = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+          open(f'.diag/{stamp}-ssl.md', 'w').write(content)
+          print(f"\nWrote .diag/ssl-status.md ({len(content)} chars)")
+          PYEOF
+
+          git config user.email "ssl-provision@github-actions"
+          git config user.name "ssl-provision"
+          git add .diag/
+          git commit -m "ssl-provision [skip ci]: $(date -u +%Y%m%d-%H%M%S)" || echo "nothing to commit"
+          git push origin master 2>&1 | tail -5 || echo "push failed"
