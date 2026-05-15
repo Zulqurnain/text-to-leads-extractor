@@ -96,12 +96,15 @@ jobs:
           print('Wrote startup.js')
 
           # Write .htaccess for CloudLinux Passenger into the bundle
-          # (uploaded via FTP — more reliable than cPanel Fileman API)
+          # Using system node binary confirmed working by tools-doctor v5 diagnostics.
+          # /opt/alt/alt-nodejs22/root/usr/bin/node is the CloudLinux alt-nodejs22 binary
+          # which is available on this Namecheap shared hosting server.
+          NODEJS_BIN = "/opt/alt/alt-nodejs22/root/usr/bin/node"
           htaccess = (
             '# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n'
             'PassengerEnabled On\n'
             'PassengerBaseURI /\n'
-            f'PassengerNodejs /home/{cpanel_user}/nodevenv/tools.zulqurnainj.com/22/bin/node\n'
+            f'PassengerNodejs {NODEJS_BIN}\n'
             f'PassengerAppRoot /home/{cpanel_user}/tools.zulqurnainj.com\n'
             'PassengerAppType node\n'
             'PassengerStartupFile startup.js\n'
@@ -273,11 +276,10 @@ jobs:
           except Exception as e:
               print(f"  Parse error: {e}")
 
-          if not nodejs_path:
-              nodejs_path = f"/home/{u}/nodevenv/{domain}/{registered_node}/bin/node"
-              print(f"  Falling back to nodevenv path: {nodejs_path}")
-          else:
-              print(f"  nodejs_path from API: {nodejs_path}")
+          # Always use the system node binary confirmed working by tools-doctor v5.
+          # Registration/nodevenv approach consistently fails on this server.
+          nodejs_path = "/opt/alt/alt-nodejs22/root/usr/bin/node"
+          print(f"  Using hardcoded working nodejs_path: {nodejs_path}")
 
           # ── 4. Write .htaccess via Fileman API (authoritative, post-registration) ──
           # The FTP-uploaded .htaccess has hardcoded node 22; this overwrites with
@@ -296,7 +298,7 @@ jobs:
           print(f"  Content:\n{htaccess}")
           r_file = curl_post(
               f"{uapi}/Fileman/save_file_content",
-              {"dir": app_path, "filename": ".htaccess", "content": htaccess}
+              {"dir": app_path, "file": ".htaccess", "content": htaccess}
           )
           print(f"  Fileman ok={ok(r_file)}")
 
@@ -331,16 +333,48 @@ jobs:
               print(f"  HTTP check failed: {e}")
 
           # ── 7. Provision SSL ──
+          # Must temporarily disable Passenger so ACME HTTP-01 challenge can serve
+          # static files from /.well-known/acme-challenge/ without being intercepted.
           print("\n── SSL ──")
+          print("  Disabling Passenger temporarily for ACME challenge...")
+          r_dis2 = curl_get(f"{uapi}/PassengerApps/disable_application?name={app_name}")
+          print(f"  Disable ok={ok(r_dis2)}")
+
+          # Write minimal .htaccess that serves static files (no Passenger)
+          acme_htaccess = "Options -Indexes\n"
+          r_acme_ht = curl_post(
+              f"{uapi}/Fileman/save_file_content",
+              {"dir": app_path, "file": ".htaccess", "content": acme_htaccess}
+          )
+          print(f"  Minimal .htaccess ok={ok(r_acme_ht)}")
+          time.sleep(3)
+
+          # Try LetsEncrypt module first
           ssl_params = urllib.parse.urlencode({
               "domains[0]": domain, "keytype": "prime256v1",
           })
           r_ssl = curl_get(f"{uapi}/LetsEncrypt/issue?{ssl_params}", timeout=180)
-          print(f"  LetsEncrypt ok={ok(r_ssl)}")
+          print(f"  LetsEncrypt ok={ok(r_ssl)} resp={json.dumps(parse(r_ssl))[:300]}")
           if not ok(r_ssl):
-              print("  Trying AutoSSL fallback")
-              r_auto = curl_get(f"{uapi}/SSL/start_autossl_check_cpanel_domains")
-              print(f"  AutoSSL ok={ok(r_auto)}")
+              # Correct function name is SSL/start_autossl_check (not *_cpanel_domains)
+              print("  Trying AutoSSL fallback...")
+              r_auto = curl_get(f"{uapi}/SSL/start_autossl_check")
+              print(f"  AutoSSL ok={ok(r_auto)} resp={json.dumps(parse(r_auto))[:300]}")
+
+          print("  Waiting 45s for cert provision...")
+          time.sleep(45)
+
+          # Re-enable Passenger with correct node path
+          print("  Re-enabling Passenger...")
+          r_file2 = curl_post(
+              f"{uapi}/Fileman/save_file_content",
+              {"dir": app_path, "file": ".htaccess", "content": htaccess}
+          )
+          print(f"  Restore .htaccess ok={ok(r_file2)}")
+          r_en2 = curl_get(f"{uapi}/PassengerApps/enable_application?name={app_name}")
+          print(f"  Re-enable ok={ok(r_en2)}")
+          print("  Waiting 20s for app restart...")
+          time.sleep(20)
 
           # ── 8. Final checks + write status to a public file we can read ──
           print("\n── Final checks ──")
