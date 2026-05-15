@@ -1,0 +1,302 @@
+name: SSL via DNS-01 (cPanel ZoneEdit)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/dns01-trigger.txt'
+
+concurrency:
+  group: ssl-dns01
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  dns01:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      H: ${{ secrets.CPANEL_HOST }}
+      U: ${{ secrets.CPANEL_USER }}
+      P: ${{ secrets.CPANEL_PASS }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install certbot
+        run: sudo apt-get update -q && sudo apt-get install -y certbot
+
+      - name: Probe ZoneEdit API + list current DNS records
+        run: |
+          python3 << 'PYEOF'
+          import os, subprocess, json
+          h, u, p = os.environ['H'], os.environ['U'], os.environ['P']
+          uapi = f"https://{h}:2083/execute"
+          domain = "zulqurnainj.com"
+
+          def cget(url):
+              return subprocess.check_output(['curl','-sk','-u',f'{u}:{p}',url], text=True, timeout=30)
+
+          # List all zones
+          r = cget(f"{uapi}/ZoneEdit/fetch_zone_records?domain={domain}&type=TXT")
+          print("ZoneEdit/fetch_zone_records TXT:", r[:2000])
+          PYEOF
+
+      - name: Write certbot hook scripts
+        run: |
+          mkdir -p /tmp/cb
+
+          # Auth hook: add TXT record for _acme-challenge.tools.zulqurnainj.com
+          cat > /tmp/cb/auth.sh << 'HOOKEOF'
+          #!/bin/bash
+          set -euo pipefail
+          H="${H}"
+          U="${U}"
+          P="${P}"
+          UAPI="https://${H}:2083/execute"
+          DOMAIN="zulqurnainj.com"
+          REC_NAME="_acme-challenge.tools"
+          VAL="${CERTBOT_VALIDATION}"
+
+          echo ">>> Adding TXT ${REC_NAME}.${DOMAIN} = ${VAL}"
+
+          # Remove any existing _acme-challenge TXT records first
+          EXISTING=$(curl -sk -u "${U}:${P}" \
+            "${UAPI}/ZoneEdit/fetch_zone_records?domain=${DOMAIN}&type=TXT&name=${REC_NAME}.${DOMAIN}.")
+          echo "Existing records: ${EXISTING:0:500}"
+
+          # Add new TXT record
+          RESP=$(curl -sk -u "${U}:${P}" -X POST \
+            --data-urlencode "domain=${DOMAIN}" \
+            --data-urlencode "type=TXT" \
+            --data-urlencode "name=${REC_NAME}" \
+            --data-urlencode "txtdata=${VAL}" \
+            --data-urlencode "ttl=60" \
+            "${UAPI}/ZoneEdit/add_zone_record")
+          echo "add_zone_record response: ${RESP:0:500}"
+
+          # Wait for DNS to propagate
+          echo "Waiting 30s for DNS propagation..."
+          sleep 30
+
+          # Verify the record was added
+          VERIFY=$(curl -sk -u "${U}:${P}" \
+            "${UAPI}/ZoneEdit/fetch_zone_records?domain=${DOMAIN}&type=TXT")
+          echo "Records after add: ${VERIFY:0:1000}"
+
+          # Also do a live DNS check from outside
+          dig_out=$(dig +short TXT "_acme-challenge.tools.${DOMAIN}" @8.8.8.8 2>/dev/null || echo "dig failed")
+          echo "dig _acme-challenge.tools.${DOMAIN} TXT: ${dig_out}"
+          HOOKEOF
+          chmod +x /tmp/cb/auth.sh
+
+          # Cleanup hook: remove the TXT record
+          cat > /tmp/cb/cleanup.sh << 'HOOKEOF'
+          #!/bin/bash
+          set -euo pipefail
+          H="${H}"
+          U="${U}"
+          P="${P}"
+          UAPI="https://${H}:2083/execute"
+          DOMAIN="zulqurnainj.com"
+          REC_NAME="_acme-challenge.tools"
+
+          echo ">>> Removing TXT ${REC_NAME}.${DOMAIN}"
+
+          # Fetch records to find the line number
+          RECS=$(curl -sk -u "${U}:${P}" \
+            "${UAPI}/ZoneEdit/fetch_zone_records?domain=${DOMAIN}&type=TXT")
+          echo "Records: ${RECS:0:2000}"
+
+          # Parse line numbers for _acme-challenge.tools records
+          python3 - << 'PYEOF'
+          import os, subprocess, json
+          h, u, p = os.environ['H'], os.environ['U'], os.environ['P']
+          uapi = f"https://{h}:2083/execute"
+          domain = "zulqurnainj.com"
+          rec_name = "_acme-challenge.tools." + domain + "."
+
+          r = subprocess.check_output(
+              ['curl','-sk','-u',f'{u}:{p}',
+               f'{uapi}/ZoneEdit/fetch_zone_records?domain={domain}&type=TXT'],
+              text=True, timeout=30
+          )
+          try:
+              data = json.loads(r)
+              recs = (data.get('result',data).get('data') or {}).get('record', [])
+              for rec in recs:
+                  name = rec.get('name','')
+                  if '_acme-challenge' in name:
+                      line = rec.get('line', '')
+                      print(f"Removing line {line}: {rec}")
+                      rm = subprocess.check_output(
+                          ['curl','-sk','-u',f'{u}:{p}','-X','POST',
+                           '--data-urlencode', f'domain={domain}',
+                           '--data-urlencode', f'line={line}',
+                           f'{uapi}/ZoneEdit/remove_zone_record'],
+                          text=True, timeout=30
+                      )
+                      print("remove response:", rm[:300])
+          except Exception as e:
+              print(f"cleanup error: {e}")
+          PYEOF
+          HOOKEOF
+          chmod +x /tmp/cb/cleanup.sh
+
+      - name: Run certbot with DNS-01 challenge
+        run: |
+          sudo H=$H U=$U P=$P certbot certonly \
+            --manual \
+            --preferred-challenges dns \
+            --manual-auth-hook /tmp/cb/auth.sh \
+            --manual-cleanup-hook /tmp/cb/cleanup.sh \
+            --non-interactive \
+            --agree-tos \
+            --register-unsafely-without-email \
+            -d tools.zulqurnainj.com 2>&1 | tee /tmp/certbot.log
+
+          echo "=== certbot exit code: $?"
+          echo "=== cert files:"
+          sudo ls -la /etc/letsencrypt/live/tools.zulqurnainj.com/ 2>/dev/null || echo "no cert dir"
+
+      - name: Install cert via cPanel SSL/install_ssl
+        run: |
+          sudo chmod -R a+r /etc/letsencrypt/live/tools.zulqurnainj.com/ \
+                            /etc/letsencrypt/archive/tools.zulqurnainj.com/
+
+          python3 << 'PYEOF'
+          import os, subprocess, json
+          h, u, p = os.environ['H'], os.environ['U'], os.environ['P']
+          uapi = f"https://{h}:2083/execute"
+          domain = "tools.zulqurnainj.com"
+          live = f"/etc/letsencrypt/live/{domain}"
+
+          try:
+              cert     = open(f"{live}/cert.pem").read()
+              key      = open(f"{live}/privkey.pem").read()
+              cab      = open(f"{live}/chain.pem").read()
+              print(f"cert={len(cert)}B  key={len(key)}B  chain={len(cab)}B")
+          except Exception as e:
+              print(f"ERROR reading cert files: {e}")
+              exit(1)
+
+          cmd = ['curl','-sk','-u',f'{u}:{p}','-X','POST',
+                 '--data-urlencode', f'domain={domain}',
+                 '--data-urlencode', f'cert={cert}',
+                 '--data-urlencode', f'key={key}',
+                 '--data-urlencode', f'cabundle={cab}',
+                 f"{uapi}/SSL/install_ssl"]
+          r = subprocess.check_output(cmd, text=True, timeout=120)
+          print("SSL/install_ssl response:")
+          print(r[:3000])
+
+          data = json.loads(r)
+          result = data.get('result', data)
+          if result.get('status') == 1:
+              print("\n✅ SSL cert installed successfully!")
+          else:
+              errs = result.get('errors', [])
+              print(f"\n❌ SSL install failed: {errs}")
+              exit(1)
+          PYEOF
+
+      - name: Verify cert and restore/restart Passenger
+        run: |
+          python3 << 'PYEOF'
+          import os, subprocess, json, time, datetime, ssl, socket
+
+          h, u, p = os.environ['H'], os.environ['U'], os.environ['P']
+          uapi = f"https://{h}:2083/execute"
+          domain = "tools.zulqurnainj.com"
+          app_path = f"/home/{u}/{domain}"
+          NODEJS_BIN = "/opt/alt/alt-nodejs22/root/usr/bin/node"
+
+          out = []
+          def log(s): out.append(str(s)); print(s)
+
+          def cget(url, timeout=30):
+              return subprocess.check_output(['curl','-sk','-u',f'{u}:{p}',url], text=True, timeout=timeout)
+          def cpost(url, data, timeout=30):
+              cmd = ['curl','-sk','-u',f'{u}:{p}','-X','POST']
+              for k,v in data.items(): cmd += ['--data-urlencode', f'{k}={v}']
+              cmd.append(url)
+              return subprocess.check_output(cmd, text=True, timeout=timeout)
+
+          log(f"# SSL DNS-01 Result — {datetime.datetime.utcnow().isoformat()}Z")
+
+          # Wait for cert to propagate on server
+          log("Waiting 20s for cert to take effect...")
+          time.sleep(20)
+
+          # Ensure Passenger is enabled with correct .htaccess
+          htaccess = (
+              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n"
+              "PassengerEnabled On\n"
+              "PassengerBaseURI /\n"
+              f"PassengerNodejs {NODEJS_BIN}\n"
+              f"PassengerAppRoot {app_path}\n"
+              "PassengerAppType node\n"
+              "PassengerStartupFile startup.js\n"
+              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n"
+          )
+          r_ht = cpost(f"{uapi}/Fileman/save_file_content",
+                       {"dir": app_path, "file": ".htaccess", "content": htaccess})
+          log(f"ensure .htaccess: {r_ht[:200]}")
+
+          r_en = cget(f"{uapi}/PassengerApps/enable_application?name=tools")
+          log(f"enable_application: {r_en[:200]}")
+
+          # Restart Passenger by touching restart.txt
+          cpost(f"{uapi}/Fileman/save_file_content",
+                {"dir": app_path + "/tmp", "file": "restart.txt", "content": str(time.time())})
+          time.sleep(25)
+
+          # Check new cert
+          log("\n## New TLS cert")
+          try:
+              ctx = ssl.create_default_context()
+              ctx.check_hostname = False
+              ctx.verify_mode = ssl.CERT_NONE
+              with socket.create_connection((domain, 443), timeout=15) as sock:
+                  with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+                      der = ssock.getpeercert(binary_form=True)
+                      p2 = subprocess.run(
+                          ['openssl','x509','-inform','DER','-noout',
+                           '-subject','-issuer','-dates','-ext','subjectAltName'],
+                          input=der, capture_output=True, timeout=10
+                      )
+                      log(p2.stdout.decode())
+          except Exception as e:
+              log(f"TLS check error: {e}")
+
+          # Final HTTP/S checks
+          log("\n## Final HTTP/HTTPS checks")
+          for scheme in ('http', 'https'):
+              for verify_flag, label in (('-s', 'strict'), ('-sk', 'insecure')):
+                  try:
+                      code = subprocess.check_output(
+                          ['curl', verify_flag, '-o', '/dev/null', '-w', '%{http_code}',
+                           '--max-time', '20', f'{scheme}://{domain}/text-to-leads'],
+                          text=True, timeout=25
+                      )
+                      log(f"  {scheme} ({label}): {code}")
+                  except subprocess.CalledProcessError as e:
+                      log(f"  {scheme} ({label}): err={e.returncode}")
+
+          os.makedirs('.diag', exist_ok=True)
+          content = '\n'.join(out)
+          stamp = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+          open('.diag/ssl-status.md', 'w').write(content)
+          open(f'.diag/{stamp}-dns01.md', 'w').write(content)
+          print(f"Wrote .diag/{stamp}-dns01.md ({len(content)} chars)")
+          PYEOF
+
+          git config user.email "ssl-dns01@github-actions"
+          git config user.name "ssl-dns01"
+          git add .diag/
+          git commit -c gpg.format=ssh -c commit.gpgsign=false \
+            -m "ssl-dns01 [skip ci]: $(date -u +%Y%m%d-%H%M%S)" || echo "nothing to commit"
+          git push origin master 2>&1 | tail -5 || echo "push failed"
