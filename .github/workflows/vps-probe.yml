@@ -1,0 +1,107 @@
+name: VPS Probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/vps-probe-trigger.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sshpass
+        run: sudo apt-get install -y sshpass
+
+      - name: Probe VPS
+        env:
+          H: ${{ secrets.VPS_HOST }}
+          U: ${{ secrets.VPS_USER }}
+          P: ${{ secrets.VPS_PASS }}
+        run: |
+          export SSHPASS="$P"
+          SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 $U@$H"
+
+          echo "=== OS ==="
+          $SSH "cat /etc/os-release"
+
+          echo "=== CPU / RAM ==="
+          $SSH "nproc && free -h | grep Mem && df -h / | tail -1"
+
+          echo "=== Installed software ==="
+          $SSH "
+            for cmd in nginx node npm pm2 mysql certbot docker git; do
+              path=\$(which \$cmd 2>/dev/null)
+              if [ -n \"\$path\" ]; then
+                ver=\$(\$cmd --version 2>&1 | head -1)
+                echo \"\$cmd: \$path — \$ver\"
+              else
+                echo \"\$cmd: NOT INSTALLED\"
+              fi
+            done
+          "
+
+          echo "=== Listening ports ==="
+          $SSH "ss -tlnp 2>/dev/null | head -30 || netstat -tlnp 2>/dev/null | head -30"
+
+          echo "=== /etc/nginx/ ==="
+          $SSH "ls /etc/nginx/ 2>/dev/null || echo 'nginx dir not found'"
+
+          echo "=== UFW / firewall ==="
+          $SSH "ufw status 2>/dev/null || iptables -L INPUT --line-numbers 2>/dev/null | head -20"
+
+      - name: Save probe results
+        if: always()
+        env:
+          H: ${{ secrets.VPS_HOST }}
+          U: ${{ secrets.VPS_USER }}
+          P: ${{ secrets.VPS_PASS }}
+        run: |
+          export SSHPASS="$P"
+          SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 $U@$H"
+
+          mkdir -p .diag
+          {
+            echo "# VPS Probe — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "IP: $H"
+            echo ""
+            echo "## OS"
+            $SSH "cat /etc/os-release" 2>&1
+            echo ""
+            echo "## Resources"
+            $SSH "nproc && free -h | grep Mem && df -h / | tail -1" 2>&1
+            echo ""
+            echo "## Software"
+            $SSH "for cmd in nginx node npm pm2 mysql certbot docker git python3; do
+              path=\$(which \$cmd 2>/dev/null)
+              if [ -n \"\$path\" ]; then
+                ver=\$(\$cmd --version 2>&1 | head -1)
+                echo \"\$cmd: \$path — \$ver\"
+              else
+                echo \"\$cmd: NOT INSTALLED\"
+              fi
+            done" 2>&1
+            echo ""
+            echo "## Ports"
+            $SSH "ss -tlnp 2>/dev/null | head -30" 2>&1
+            echo ""
+            echo "## Nginx config files"
+            $SSH "ls /etc/nginx/sites-available/ 2>/dev/null; ls /etc/nginx/conf.d/ 2>/dev/null; cat /etc/nginx/sites-enabled/* 2>/dev/null" 2>&1
+            echo ""
+            echo "## UFW"
+            $SSH "ufw status 2>/dev/null" 2>&1
+          } > .diag/vps-probe.md
+
+          git config user.email "vps-probe@github-actions"
+          git config user.name "vps-probe"
+          git add .diag/vps-probe.md
+          git -c gpg.format=ssh -c commit.gpgsign=false \
+            -m "vps-probe [skip ci]: $(date -u +%Y%m%d-%H%M%S)" || echo "nothing to commit"
+          git push origin master 2>&1 | tail -3 || echo "push failed"
