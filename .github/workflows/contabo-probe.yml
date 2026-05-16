@@ -1,0 +1,105 @@
+name: Contabo API Probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/contabo-probe-trigger.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CL_ID:   ${{ secrets.CONTABO_CLIENT_ID }}
+      CL_SEC:  ${{ secrets.CONTABO_CLIENT_SECRET }}
+      CONT_U:  ${{ secrets.CONTABO_USER }}
+      CONT_P:  ${{ secrets.CONTABO_PASS }}
+      VPS_H:   ${{ secrets.VPS_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe Contabo API
+        run: |
+          mkdir -p .diag
+          REPORT=.diag/contabo-probe.md
+          {
+            echo "# Contabo API Probe — $(date -u +%FT%TZ)"
+            echo ""
+            echo "## Step 1: Get OAuth token"
+            echo '```'
+            TOK_JSON=$(curl -sS -X POST \
+              "https://auth.contabo.com/auth/realms/contabo/protocol/openid-connect/token" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "client_id=$CL_ID" \
+              --data-urlencode "client_secret=$CL_SEC" \
+              --data-urlencode "username=$CONT_U" \
+              --data-urlencode "password=$CONT_P" \
+              --data-urlencode "grant_type=password" 2>&1)
+            echo "$TOK_JSON" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print('keys:', list(d.keys())); print('access_token len:', len(d.get('access_token',''))); print('error:', d.get('error'), d.get('error_description'))" 2>&1 || echo "RAW: $TOK_JSON"
+            TOKEN=$(echo "$TOK_JSON" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('access_token',''))" 2>/dev/null)
+            echo '```'
+
+            if [ -z "$TOKEN" ]; then
+              echo ""
+              echo "❌ NO TOKEN — cannot continue. Likely cause: bad credentials or API not enabled."
+              exit 0
+            fi
+
+            echo ""
+            echo "## Step 2: List instances"
+            echo '```'
+            INST=$(curl -sS -H "Authorization: Bearer $TOKEN" -H "x-request-id: probe-$(date +%s)" \
+              "https://api.contabo.com/v1/compute/instances")
+            echo "$INST" | python3 -m json.tool 2>&1 | head -80
+            echo '```'
+
+            echo ""
+            echo "## Step 3: Find our instance ($VPS_H)"
+            echo '```'
+            echo "$INST" | python3 -c "
+            import sys, json
+            d = json.loads(sys.stdin.read())
+            target = '$VPS_H'
+            for i in d.get('data', []):
+                ip4 = i.get('ipConfig', {}).get('v4', {}).get('ip') or i.get('ipv4', '')
+                print(f\"  instance {i.get('instanceId')}: ip={ip4} image={i.get('imageId')} status={i.get('status')} name={i.get('name')}\")
+                if ip4 == target:
+                    print(f\"  → MATCH! Full details:\")
+                    print(json.dumps(i, indent=2))
+            "
+            echo '```'
+
+            echo ""
+            echo "## Step 4: List available images (first 10)"
+            echo '```'
+            curl -sS -H "Authorization: Bearer $TOKEN" -H "x-request-id: img-$(date +%s)" \
+              "https://api.contabo.com/v1/compute/images?size=10" \
+              | python3 -c "
+            import sys, json
+            d = json.loads(sys.stdin.read())
+            for img in d.get('data', [])[:15]:
+                print(f\"  {img.get('imageId')}: {img.get('name')} ({img.get('osType')})\")
+            "
+            echo '```'
+
+            echo ""
+            echo "## Step 5: List secrets (existing SSH keys / passwords)"
+            echo '```'
+            curl -sS -H "Authorization: Bearer $TOKEN" -H "x-request-id: sec-$(date +%s)" \
+              "https://api.contabo.com/v1/secrets" \
+              | python3 -m json.tool 2>&1 | head -50
+            echo '```'
+
+          } | tee $REPORT
+
+          git config user.email "contabo-probe@github-actions"
+          git config user.name "contabo-probe"
+          git add .diag/contabo-probe.md
+          git -c gpg.format=ssh -c commit.gpgsign=false commit \
+            -m "contabo-probe [skip ci]: $(date -u +%Y%m%d-%H%M%S)" || echo "nothing to commit"
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git master 2>&1 | tail -3
