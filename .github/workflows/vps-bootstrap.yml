@@ -1,0 +1,272 @@
+name: VPS Bootstrap
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/vps-bootstrap-trigger.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      H:        ${{ secrets.VPS_HOST }}
+      U:        ${{ secrets.VPS_USER }}
+      PASS_A:   ${{ secrets.VPS_PASS }}
+      PASS_B:   ${{ secrets.VPS_PASS_ALT }}
+      CL_ID:    ${{ secrets.CONTABO_CLIENT_ID }}
+      CL_SEC:   ${{ secrets.CONTABO_CLIENT_SECRET }}
+      CONT_U:   ${{ secrets.CONTABO_USER }}
+      CONT_P:   ${{ secrets.CONTABO_PASS }}
+      PAT:      ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get install -y sshpass netcat-openbsd jq python3-pip && pip install PyNaCl -q
+
+      - name: Generate fresh ed25519 keypair
+        run: |
+          mkdir -p /tmp/k
+          ssh-keygen -t ed25519 -N "" -f /tmp/k/id_ed25519 -C "github-actions@zulqurnainj.com"
+          echo "PUB=$(cat /tmp/k/id_ed25519.pub)" >> $GITHUB_ENV
+          chmod 600 /tmp/k/id_ed25519
+
+      - name: Probe + install SSH key
+        id: probe
+        run: |
+          set +e
+          mkdir -p .diag
+          REPORT=.diag/vps-bootstrap.md
+          {
+            echo "# VPS Bootstrap — $(date -u +%FT%TZ)"
+            echo "Host: $H  User: $U"
+            echo ""
+            echo "## Port 22 reachability"
+          } > $REPORT
+
+          if nc -z -w 8 "$H" 22; then
+            echo "Port 22: OPEN" >> $REPORT
+          else
+            echo "Port 22: CLOSED/FILTERED — VPS may still be provisioning" >> $REPORT
+          fi
+
+          install_key() {
+            local pw="$1"
+            export SSHPASS="$pw"
+            sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=20 -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+              "$U@$H" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qxF '$PUB' ~/.ssh/authorized_keys 2>/dev/null || echo '$PUB' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo 'KEY_OK'" 2>&1
+          }
+
+          echo "" >> $REPORT
+          echo "## SSH password attempts" >> $REPORT
+          for label in A B; do
+            if [ "$label" = "A" ]; then PW="$PASS_A"; else PW="$PASS_B"; fi
+            echo "" >> $REPORT
+            echo "### Password $label" >> $REPORT
+            OUT=$(install_key "$PW")
+            EC=$?
+            echo '```' >> $REPORT
+            echo "$OUT" >> $REPORT
+            echo "exit=$EC" >> $REPORT
+            echo '```' >> $REPORT
+            if echo "$OUT" | grep -q "KEY_OK"; then
+              echo "VALID_PASS=$PW" >> $GITHUB_ENV
+              echo "BOOTSTRAP_METHOD=password" >> $GITHUB_ENV
+              echo "  → Password $label WORKED, SSH key installed."
+              break
+            fi
+          done
+
+          # If we got here without VALID_PASS, fall through to API reinstall in next step
+          if [ -z "$VALID_PASS" ]; then
+            echo "BOOTSTRAP_METHOD=api" >> $GITHUB_ENV
+            echo "" >> $REPORT
+            echo "Both passwords failed — will use Contabo API reinstall." >> $REPORT
+          fi
+
+      - name: Contabo API reinstall (fallback if SSH passwords fail)
+        if: env.BOOTSTRAP_METHOD == 'api'
+        run: |
+          set -e
+          REPORT=.diag/vps-bootstrap.md
+          {
+            echo ""
+            echo "## Contabo API reinstall"
+          } >> $REPORT
+
+          # 1. Get access token
+          TOK_JSON=$(curl -s -X POST \
+            "https://auth.contabo.com/auth/realms/contabo/protocol/openid-connect/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "client_id=$CL_ID" \
+            --data-urlencode "client_secret=$CL_SEC" \
+            --data-urlencode "username=$CONT_U" \
+            --data-urlencode "password=$CONT_P" \
+            --data-urlencode "grant_type=password")
+          TOKEN=$(echo "$TOK_JSON" | jq -r .access_token)
+          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+            echo "TOKEN FETCH FAILED:" >> $REPORT
+            echo '```' >> $REPORT; echo "$TOK_JSON" >> $REPORT; echo '```' >> $REPORT
+            exit 1
+          fi
+          echo "Token: OK" >> $REPORT
+
+          REQUEST_ID="bootstrap-$(date +%s)"
+
+          # 2. List instances, find ours
+          INSTANCES=$(curl -s -H "Authorization: Bearer $TOKEN" \
+            -H "x-request-id: $REQUEST_ID-list" \
+            "https://api.contabo.com/v1/compute/instances")
+          INSTANCE_ID=$(echo "$INSTANCES" | jq -r ".data[] | select(.ipv4 == \"$H\") | .instanceId")
+          IMAGE_ID=$(echo "$INSTANCES" | jq -r ".data[] | select(.ipv4 == \"$H\") | .imageId")
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "null" ]; then
+            echo "Could not find instance with IP $H. Full list:" >> $REPORT
+            echo '```json' >> $REPORT; echo "$INSTANCES" | jq . >> $REPORT; echo '```' >> $REPORT
+            exit 1
+          fi
+          echo "Instance ID: $INSTANCE_ID  Image: $IMAGE_ID" >> $REPORT
+
+          # 3. Create SSH key secret
+          PUBKEY_JSON=$(jq -n --arg n "gha-key-$(date +%s)" --arg v "$PUB" \
+            '{name:$n, type:"ssh", value:$v}')
+          SECRET_RESP=$(curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+            -H "x-request-id: $REQUEST_ID-secret" \
+            -H "Content-Type: application/json" \
+            -d "$PUBKEY_JSON" \
+            "https://api.contabo.com/v1/secrets")
+          SSH_SECRET_ID=$(echo "$SECRET_RESP" | jq -r '.data[0].secretId')
+          echo "SSH secret ID: $SSH_SECRET_ID" >> $REPORT
+
+          # 4. Create root password secret (random 32-char)
+          NEWPASS=$(openssl rand -base64 24 | tr -d '=+/' | head -c 32)
+          PWJSON=$(jq -n --arg n "gha-rootpw-$(date +%s)" --arg v "$NEWPASS" \
+            '{name:$n, type:"password", value:$v}')
+          PW_RESP=$(curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+            -H "x-request-id: $REQUEST_ID-pw" \
+            -H "Content-Type: application/json" \
+            -d "$PWJSON" \
+            "https://api.contabo.com/v1/secrets")
+          PW_SECRET_ID=$(echo "$PW_RESP" | jq -r '.data[0].secretId')
+          echo "Password secret ID: $PW_SECRET_ID" >> $REPORT
+          echo "NEW_ROOT_PASS=$NEWPASS" >> $GITHUB_ENV
+
+          # 5. Reinstall instance with SSH key + new password (Ubuntu 24.04 standard image)
+          # imageId for Ubuntu 24.04 is "afecbb85-e2fc-46f0-9684-b46b1faf00bb" — but use current if we have it
+          REINSTALL=$(jq -n \
+            --arg img "$IMAGE_ID" \
+            --argjson sk "$SSH_SECRET_ID" \
+            --argjson pw "$PW_SECRET_ID" \
+            '{imageId:$img, sshKeys:[$sk], rootPassword:$pw, defaultUser:"root"}')
+          REI_RESP=$(curl -s -X PUT -H "Authorization: Bearer $TOKEN" \
+            -H "x-request-id: $REQUEST_ID-reinstall" \
+            -H "Content-Type: application/json" \
+            -d "$REINSTALL" \
+            "https://api.contabo.com/v1/compute/instances/$INSTANCE_ID")
+          echo "Reinstall response:" >> $REPORT
+          echo '```json' >> $REPORT; echo "$REI_RESP" | jq . >> $REPORT; echo '```' >> $REPORT
+
+          # 6. Poll until SSH key works
+          echo "Waiting for VPS to come back (up to 10 min)..." >> $REPORT
+          for i in $(seq 1 60); do
+            sleep 10
+            if ssh -i /tmp/k/id_ed25519 -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                 -o PubkeyAuthentication=yes -o PasswordAuthentication=no \
+                 "$U@$H" "echo READY" 2>/dev/null | grep -q READY; then
+              echo "VPS back online after ${i}0s" >> $REPORT
+              break
+            fi
+            echo "  poll $i: not ready"
+          done
+
+      - name: Gather system inventory
+        run: |
+          REPORT=.diag/vps-bootstrap.md
+          {
+            echo ""
+            echo "## System inventory"
+          } >> $REPORT
+
+          ssh -i /tmp/k/id_ed25519 -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+              "$U@$H" "
+            echo '### OS'
+            cat /etc/os-release
+            echo ''
+            echo '### Resources'
+            echo \"CPU: \$(nproc) cores\"
+            free -h | grep Mem
+            df -h / | tail -1
+            echo ''
+            echo '### Software'
+            for cmd in nginx node npm pm2 mysql certbot docker git python3 jq curl; do
+              path=\$(which \$cmd 2>/dev/null)
+              if [ -n \"\$path\" ]; then
+                ver=\$(\$cmd --version 2>&1 | head -1)
+                echo \"  \$cmd: \$ver\"
+              else
+                echo \"  \$cmd: NOT INSTALLED\"
+              fi
+            done
+            echo ''
+            echo '### Listening ports'
+            ss -tlnp 2>/dev/null | head -15
+            echo ''
+            echo '### Firewall'
+            ufw status 2>/dev/null || echo 'ufw not active'
+          " 2>&1 >> $REPORT
+
+      - name: Save SSH private key as GitHub secret VPS_SSH_KEY
+        env:
+          PAT: ${{ secrets.WORKFLOW_PAT }}
+        run: |
+          # Use WORKFLOW_PAT (PAT with full repo scope) since GITHUB_TOKEN can't write secrets
+          # If WORKFLOW_PAT not set, fall back to noting it for manual setup
+          if [ -z "$PAT" ]; then
+            echo "WORKFLOW_PAT secret not configured — private key NOT saved to secrets."
+            echo "Manual step: copy /tmp/k/id_ed25519 contents to GitHub secret VPS_SSH_KEY."
+            cat /tmp/k/id_ed25519
+            exit 0
+          fi
+          python3 <<'PYEOF'
+          import base64, json, subprocess, os
+          from nacl import encoding, public
+
+          PAT = os.environ['PAT']
+          KEY = open('/tmp/k/id_ed25519').read()
+
+          for repo in ('Zulqurnain/text-to-leads-extractor', 'Zulqurnain/zulqurnainj.com'):
+              r = subprocess.check_output(
+                  ['curl','-s','-H',f'Authorization: token {PAT}',
+                   '-H','Accept: application/vnd.github+json',
+                   f'https://api.github.com/repos/{repo}/actions/secrets/public-key'],
+                  text=True
+              )
+              kd = json.loads(r)
+              pk = public.PublicKey(kd['key'].encode(), encoding.Base64Encoder())
+              enc = base64.b64encode(public.SealedBox(pk).encrypt(KEY.encode())).decode()
+              payload = json.dumps({"encrypted_value": enc, "key_id": kd['key_id']})
+              code = subprocess.check_output(
+                  ['curl','-s','-o','/dev/null','-w','%{http_code}','-X','PUT',
+                   '-H',f'Authorization: token {PAT}',
+                   '-H','Accept: application/vnd.github+json',
+                   '-d', payload,
+                   f'https://api.github.com/repos/{repo}/actions/secrets/VPS_SSH_KEY'],
+                  text=True
+              )
+              print(f"{repo}/VPS_SSH_KEY -> HTTP {code}")
+          PYEOF
+
+      - name: Commit & push report
+        if: always()
+        run: |
+          git config user.email "vps-bootstrap@github-actions"
+          git config user.name "vps-bootstrap"
+          git add .diag/vps-bootstrap.md
+          git -c gpg.format=ssh -c commit.gpgsign=false \
+            -m "vps-bootstrap [skip ci]: $(date -u +%Y%m%d-%H%M%S)" || echo "nothing to commit"
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git master 2>&1 | tail -3 || true
