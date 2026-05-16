@@ -1,0 +1,77 @@
+name: VPS SSL (certbot)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/vps-ssl-trigger.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  ssl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      H: ${{ secrets.VPS_HOST }}
+      U: ${{ secrets.VPS_USER }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$H" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Verify DNS points to VPS
+        run: |
+          for d in zulqurnainj.com www.zulqurnainj.com tools.zulqurnainj.com; do
+            IP=$(dig +short A "$d" @8.8.8.8 | tail -1)
+            echo "$d → $IP"
+            if [ "$IP" != "$H" ]; then
+              echo "  ⚠ DNS not pointing to VPS yet; certbot will fail until DNS is updated"
+            fi
+          done
+
+      - name: Run certbot for all domains
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "$U@$H" "
+            certbot --nginx \
+              -d zulqurnainj.com -d www.zulqurnainj.com \
+              -d tools.zulqurnainj.com \
+              --non-interactive --agree-tos \
+              -m admin@zulqurnainj.com \
+              --redirect
+            systemctl reload nginx
+            certbot certificates
+          "
+
+      - name: Verify HTTPS
+        run: |
+          mkdir -p .diag
+          {
+            echo "# VPS SSL — $(date -u +%FT%TZ)"
+            echo ""
+            for url in https://zulqurnainj.com https://tools.zulqurnainj.com/text-to-leads; do
+              echo "## $url"
+              echo '```'
+              curl -sI --max-time 15 "$url" | head -5
+              echo "  TLS check:"
+              echo | openssl s_client -servername "$(echo $url | cut -d/ -f3)" \
+                -connect "$(echo $url | cut -d/ -f3):443" 2>/dev/null \
+                | openssl x509 -noout -subject -issuer -dates 2>&1 | head -4
+              echo '```'
+              echo ''
+            done
+          } | tee .diag/vps-ssl.md
+
+          git config user.email "vps-ssl@github-actions"
+          git config user.name "vps-ssl"
+          git add .diag/vps-ssl.md
+          git -c gpg.format=ssh -c commit.gpgsign=false \
+            -m "vps-ssl [skip ci]: $(date -u +%Y%m%d-%H%M%S)" || echo "nothing to commit"
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git master 2>&1 | tail -3 || true
