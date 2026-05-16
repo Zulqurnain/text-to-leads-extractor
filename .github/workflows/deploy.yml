@@ -1,13 +1,30 @@
-name: Deploy to cPanel
+name: Deploy to VPS
 
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - '.diag/**'
+      - '.github/**-trigger.txt'
+      - 'README.md'
   workflow_dispatch:
+
+concurrency:
+  group: deploy-tools
+  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      H:             ${{ secrets.VPS_HOST }}
+      U:             ${{ secrets.VPS_USER }}
+      DB_PASS:       ${{ secrets.DB_PASS }}
+      JWT_SECRET:    ${{ secrets.JWT_SECRET }}
+      LLAMA_API_URL: ${{ secrets.LLAMA_API_URL }}
+      LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
+      APP_DIR: /var/www/tools.zulqurnainj.com
     steps:
       - uses: actions/checkout@v4
 
@@ -19,464 +36,102 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      - name: Download node-llama-cpp pre-built binaries
-        continue-on-error: true
-        timeout-minutes: 10
-        run: node node_modules/node-llama-cpp/dist/cli/cli.js postinstall
-
       - name: Build (standalone)
         run: npm run build
 
-      - name: Prepare deploy bundle
-        env:
-          CPANEL_USER: ${{ secrets.CPANEL_USER }}
-          DB_PASS: ${{ secrets.DB_PASS }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          LLAMA_API_URL: ${{ secrets.LLAMA_API_URL }}
-          LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
+      - name: Assemble standalone bundle
         run: |
           cp -r .next/static .next/standalone/.next/static
-          cp -r public .next/standalone/public
-
+          cp -r public      .next/standalone/public
           mkdir -p .next/standalone/node_modules
-
-          cp -r node_modules/node-llama-cpp .next/standalone/node_modules/
-
-          if [ -f "node_modules/@node-llama-cpp/linux-x64/bins/linux-x64/llama-addon.node" ]; then
-            mkdir -p .next/standalone/node_modules/@node-llama-cpp/linux-x64
-            cp -r node_modules/@node-llama-cpp/linux-x64/bins \
-                  .next/standalone/node_modules/@node-llama-cpp/linux-x64/
-            echo "Copied linux-x64 llama-addon.node to standalone"
-          else
-            echo "llama-addon.node not found — using LLAMA_API_URL for HTTP mode"
-          fi
-
-          cp -r node_modules/offllama .next/standalone/node_modules/
-          cp -r node_modules/pdf-parse .next/standalone/node_modules/
-          for dep in lifecycle-utils express commander; do
-            [ -d "node_modules/$dep" ] && cp -r "node_modules/$dep" .next/standalone/node_modules/
+          for dep in offllama node-llama-cpp pdf-parse lifecycle-utils express commander @node-llama-cpp; do
+            if [ -d "node_modules/$dep" ]; then
+              cp -r "node_modules/$dep" .next/standalone/node_modules/
+            fi
           done
 
-          python3 - << 'PYEOF'
-          import os
-          cpanel_user = os.environ['CPANEL_USER']
-          lines = [
-            'NEXT_PUBLIC_APP_URL=https://tools.zulqurnainj.com',
-            'DB_HOST=localhost',
-            'DB_USER=' + cpanel_user + '_toolsu',
-            'DB_PASS=' + os.environ['DB_PASS'],
-            'DB_NAME=' + cpanel_user + '_toolsdb',
-            'JWT_SECRET=' + os.environ['JWT_SECRET'],
-            'CV_STORAGE_PATH=/home/' + cpanel_user + '/tool_cvs',
-            'OFFL_LLAMA_MODEL_DIR=/home/' + cpanel_user + '/offllama_models',
-          ]
-          if os.environ.get('LLAMA_API_URL', '').strip():
-            lines.append('LLAMA_API_URL=' + os.environ['LLAMA_API_URL'])
-          if os.environ.get('LLAMA_API_KEY', '').strip():
-            lines.append('LLAMA_API_KEY=' + os.environ['LLAMA_API_KEY'])
-          lines += ['NODE_ENV=production', 'PORT=3000', 'HOSTNAME=0.0.0.0']
-          with open('.next/standalone/.env', 'w') as f:
-            f.write('\n'.join(lines) + '\n')
-          print('Wrote .env with', len(lines), 'vars')
-          startup = (
-            '"use strict";\n'
-            'const fs = require("fs");\n'
-            'const path = require("path");\n'
-            'const envFile = path.join(__dirname, ".env");\n'
-            'if (fs.existsSync(envFile)) {\n'
-            '  fs.readFileSync(envFile, "utf8").split("\\n").forEach(line => {\n'
-            '    const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);\n'
-            '    if (m && m[1] && !(m[1] in process.env)) process.env[m[1]] = m[2];\n'
-            '  });\n'
-            '}\n'
-            'require("./server.js");\n'
-          )
-          with open('.next/standalone/startup.js', 'w') as f:
-            f.write(startup)
-          print('Wrote startup.js')
-
-          # Write .htaccess for CloudLinux Passenger into the bundle
-          # Using system node binary confirmed working by tools-doctor v5 diagnostics.
-          # /opt/alt/alt-nodejs22/root/usr/bin/node is the CloudLinux alt-nodejs22 binary
-          # which is available on this Namecheap shared hosting server.
-          NODEJS_BIN = "/opt/alt/alt-nodejs22/root/usr/bin/node"
-          htaccess = (
-            '# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n'
-            'PassengerEnabled On\n'
-            'PassengerBaseURI /\n'
-            f'PassengerNodejs {NODEJS_BIN}\n'
-            f'PassengerAppRoot /home/{cpanel_user}/tools.zulqurnainj.com\n'
-            'PassengerAppType node\n'
-            'PassengerStartupFile startup.js\n'
-            '# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n'
-          )
-          with open('.next/standalone/.htaccess', 'w') as f:
-            f.write(htaccess)
-          print('Wrote .htaccess')
-          PYEOF
-
-          mkdir -p .next/standalone/tmp
-          date > .next/standalone/tmp/restart.txt
-
-      - name: Install lftp
-        run: sudo apt-get install -y lftp -q
-
-      - name: Upload to server via FTP
-        env:
-          FTP_USER: ${{ secrets.FTP_USERNAME }}
-          FTP_PASS: ${{ secrets.FTP_PASSWORD }}
-          FTP_HOST: ${{ secrets.FTP_SERVER }}
+      - name: Write .env + startup.js + PM2 ecosystem
         run: |
-          lftp -c "
-            set ftp:ssl-allow yes;
-            set ftp:ssl-force no;
-            set ssl:verify-certificate no;
-            set ftp:passive-mode yes;
-            set net:timeout 120;
-            set net:max-retries 5;
-            set net:reconnect-interval-base 5;
-            set xfer:timeout 300;
-            open -u \"$FTP_USER\",\"$FTP_PASS\" ftp://$FTP_HOST;
-            mirror --reverse --delete --verbose \
-              --exclude .git/ \
-              --exclude '.next/cache/' \
-              .next/standalone/ tools.zulqurnainj.com/;
-            quit
+          cat > .next/standalone/.env <<EOF
+          NEXT_PUBLIC_APP_URL=https://tools.zulqurnainj.com
+          DB_HOST=localhost
+          DB_USER=tools_user
+          DB_PASS=$DB_PASS
+          DB_NAME=tools_db
+          JWT_SECRET=$JWT_SECRET
+          CV_STORAGE_PATH=/var/cv_storage
+          OFFL_LLAMA_MODEL_DIR=/var/www/tools.zulqurnainj.com/models
+          ${LLAMA_API_URL:+LLAMA_API_URL=$LLAMA_API_URL}
+          ${LLAMA_API_KEY:+LLAMA_API_KEY=$LLAMA_API_KEY}
+          NODE_ENV=production
+          PORT=3000
+          HOSTNAME=127.0.0.1
+          EOF
+
+          cat > .next/standalone/startup.js <<'EOF'
+          "use strict";
+          const fs = require("fs");
+          const path = require("path");
+          const envFile = path.join(__dirname, ".env");
+          if (fs.existsSync(envFile)) {
+            fs.readFileSync(envFile, "utf8").split("\n").forEach(line => {
+              const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+              if (m && m[1] && !(m[1] in process.env)) process.env[m[1]] = m[2];
+            });
+          }
+          require("./server.js");
+          EOF
+
+          cat > .next/standalone/ecosystem.config.js <<'EOF'
+          module.exports = {
+            apps: [{
+              name: "tools",
+              script: "./startup.js",
+              cwd: __dirname,
+              instances: 1,
+              exec_mode: "fork",
+              autorestart: true,
+              max_memory_restart: "1G",
+              env: { NODE_ENV: "production" }
+            }]
+          };
+          EOF
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$H" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: rsync bundle to VPS
+        run: |
+          rsync -az --delete --exclude='.env' \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            .next/standalone/ "$U@$H:$APP_DIR/"
+          scp -i ~/.ssh/id_ed25519 .next/standalone/.env "$U@$H:$APP_DIR/.env"
+
+      - name: Reload PM2
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "$U@$H" "
+            cd $APP_DIR
+            chown -R www-data:www-data .
+            chmod 600 .env
+            if pm2 describe tools >/dev/null 2>&1; then
+              pm2 reload tools --update-env
+            else
+              pm2 start ecosystem.config.js
+              pm2 save
+            fi
+            pm2 list
           "
-          echo "FTP upload complete"
 
-      - name: Configure Passenger, write .htaccess, provision SSL
-        env:
-          H: ${{ secrets.CPANEL_HOST }}
-          U: ${{ secrets.CPANEL_USER }}
-          P: ${{ secrets.CPANEL_PASS }}
+      - name: Smoke test
         run: |
-          python3 - << 'PYEOF'
-          import os, subprocess, json, urllib.parse, time
-
-          h = os.environ['H']
-          u = os.environ['U']
-          p = os.environ['P']
-          uapi = f"https://{h}:2083/execute"
-          domain = "tools.zulqurnainj.com"
-          app_name = "tools"
-          app_path = f"/home/{u}/{domain}"
-
-          def curl_get(url, timeout=30):
-              out = subprocess.check_output(
-                  ['curl', '-sk', '-u', f'{u}:{p}', url],
-                  text=True, timeout=timeout
-              )
-              # Print FULL response for diagnosis (no truncation on key calls)
-              print(f"  GET {url.split('?')[0].split('/')[-1]}: {out[:1200]}")
-              return out
-
-          def curl_post(url, data, timeout=30):
-              cmd = ['curl', '-sk', '-u', f'{u}:{p}', '-X', 'POST']
-              for k, v in data.items():
-                  cmd += ['--data-urlencode', f'{k}={v}']
-              cmd.append(url)
-              out = subprocess.check_output(cmd, text=True, timeout=timeout)
-              print(f"  POST {url.split('/')[-1]}: {out[:1200]}")
-              return out
-
-          def ok(resp):
-              """cPanel UAPI wraps status inside 'result': {'status': 1}.
-              Handle both wrapped and bare formats."""
-              try:
-                  data = json.loads(resp)
-                  # Standard UAPI: {"result": {"status": 1, ...}}
-                  if 'result' in data:
-                      return data['result'].get('status', 0) == 1
-                  # Some endpoints return bare: {"status": 1, ...}
-                  return data.get('status', 0) == 1
-              except Exception:
-                  return False
-
-          def extract_data(resp):
-              """Extract the 'data' payload regardless of UAPI wrapping."""
-              try:
-                  data = json.loads(resp)
-                  if 'result' in data:
-                      return data['result'].get('data') or {}
-                  return data.get('data') or {}
-              except Exception:
-                  return {}
-
-          # ── 0. Ensure subdomain exists ──
-          print("\n── Subdomain ──")
-          sub_params = urllib.parse.urlencode({
-              "domain": "tools", "rootdomain": "zulqurnainj.com",
-              "dir": domain, "disallowdot": "0",
-          })
-          r = curl_get(f"{uapi}/SubDomain/addsubdomain?{sub_params}")
-          if ok(r):
-              print("  Subdomain created — waiting 5s")
-              time.sleep(5)
-          else:
-              print("  Subdomain already exists or error (see raw above)")
-
-          # ── 1. List current Passenger apps (full diagnostic) ──
-          print("\n── Current Passenger apps ──")
-          r_list = curl_get(f"{uapi}/PassengerApps/list_applications")
-          try:
-              print("  PARSED:", json.dumps(json.loads(r_list), indent=2)[:2000])
-          except Exception as e:
-              print(f"  Could not parse: {e}")
-
-          # ── 2. Deregister then re-register ──
-          print("\n── Deregister ──")
-          r_dereg = curl_get(f"{uapi}/PassengerApps/deregister_application?name={app_name}")
-          print(f"  Deregister ok={ok(r_dereg)}")
-          time.sleep(3)
-
-          print("\n── Register ──")
-          registered_node = None
-          for node_ver in ("22", "20", "18"):
-              reg_params = urllib.parse.urlencode({
-                  "name": app_name, "path": app_path, "domain": domain,
-                  "base_uri": "/", "startup_file": "startup.js",
-                  "app_type": "node", "node_version": node_ver,
-                  "deployment_mode": "production",
-              })
-              r_reg = curl_get(f"{uapi}/PassengerApps/register_application?{reg_params}")
-              result_ok = ok(r_reg)
-              print(f"  Node.js {node_ver} → ok={result_ok}")
-              if result_ok:
-                  registered_node = node_ver
-                  break
-          if not registered_node:
-              # Registration may have succeeded even if ok() says False —
-              # try to discover the node version from list_applications.
-              print("  All ok() checks returned False — checking list_applications for actual state")
-              registered_node = "22"
-
-          # ── 3. Discover Node.js binary path ──
-          print("\n── Discover nodejs_path ──")
-          nodejs_path = None
-          r_list2 = curl_get(f"{uapi}/PassengerApps/list_applications")
-          try:
-              raw2 = json.loads(r_list2)
-              print("  PARSED:", json.dumps(raw2, indent=2)[:2000])
-              # Try both wrapped and bare formats
-              apps_container = (
-                  raw2.get('result', {}).get('data', {})
-                  or raw2.get('data', {})
-              )
-              apps = apps_container.get('applications', [])
-              for app in apps:
-                  if isinstance(app, dict) and app.get('name') == app_name:
-                      nodejs_path = (
-                          app.get('nodejs_path') or app.get('node_path')
-                          or app.get('nodejs_binary') or app.get('node_binary')
-                      )
-                      registered_node = str(app.get('node_version') or registered_node)
-                      print(f"  Found app: {json.dumps(app, indent=2)}")
-                      break
-          except Exception as e:
-              print(f"  Parse error: {e}")
-
-          # Always use the system node binary confirmed working by tools-doctor v5.
-          # Registration/nodevenv approach consistently fails on this server.
-          nodejs_path = "/opt/alt/alt-nodejs22/root/usr/bin/node"
-          print(f"  Using hardcoded working nodejs_path: {nodejs_path}")
-
-          # ── 4. Write .htaccess via Fileman API (authoritative, post-registration) ──
-          # The FTP-uploaded .htaccess has hardcoded node 22; this overwrites with
-          # the actual registered node version discovered above.
-          print("\n── Write .htaccess via Fileman ──")
-          htaccess = (
-              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN\n"
-              "PassengerEnabled On\n"
-              "PassengerBaseURI /\n"
-              f"PassengerNodejs {nodejs_path}\n"
-              f"PassengerAppRoot {app_path}\n"
-              "PassengerAppType node\n"
-              "PassengerStartupFile startup.js\n"
-              "# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END\n"
-          )
-          print(f"  Content:\n{htaccess}")
-          r_file = curl_post(
-              f"{uapi}/Fileman/save_file_content",
-              {"dir": app_path, "file": ".htaccess", "content": htaccess}
-          )
-          print(f"  Fileman ok={ok(r_file)}")
-
-          # ── 5. Restart cycle ──
-          print("\n── Restart ──")
-          r_dis = curl_get(f"{uapi}/PassengerApps/disable_application?name={app_name}")
-          print(f"  Disable ok={ok(r_dis)}")
-          time.sleep(3)
-          r_en = curl_get(f"{uapi}/PassengerApps/enable_application?name={app_name}")
-          print(f"  Enable ok={ok(r_en)}")
-          print("  Waiting 25s for app to start...")
-          time.sleep(25)
-
-          # ── 6. HTTP check ──
-          print("\n── HTTP check ──")
-          try:
-              code = subprocess.check_output(
-                  ['curl', '-sk', '-i', '--max-time', '15',
-                   f'http://{domain}/text-to-leads'],
-                  text=True, timeout=20
-              )
-              first_line = code.split('\n')[0]
-              # Also show x-deny-reason if present
-              deny = next((l for l in code.split('\n') if 'deny' in l.lower()), '')
-              print(f"  Response: {first_line}  {deny}")
-              if '200' in first_line or '301' in first_line or '302' in first_line:
-                  print("  ✓ App is up on HTTP")
-              else:
-                  print("  ✗ Not 2xx/3xx — full headers:")
-                  print(code[:600])
-          except Exception as e:
-              print(f"  HTTP check failed: {e}")
-
-          # ── 7. Provision SSL ──
-          # Must temporarily disable Passenger so ACME HTTP-01 challenge can serve
-          # static files from /.well-known/acme-challenge/ without being intercepted.
-          print("\n── SSL ──")
-          print("  Disabling Passenger temporarily for ACME challenge...")
-          r_dis2 = curl_get(f"{uapi}/PassengerApps/disable_application?name={app_name}")
-          print(f"  Disable ok={ok(r_dis2)}")
-
-          # Write minimal .htaccess that serves static files (no Passenger)
-          acme_htaccess = "Options -Indexes\n"
-          r_acme_ht = curl_post(
-              f"{uapi}/Fileman/save_file_content",
-              {"dir": app_path, "file": ".htaccess", "content": acme_htaccess}
-          )
-          print(f"  Minimal .htaccess ok={ok(r_acme_ht)}")
-          time.sleep(3)
-
-          # Try LetsEncrypt module first
-          ssl_params = urllib.parse.urlencode({
-              "domains[0]": domain, "keytype": "prime256v1",
-          })
-          r_ssl = curl_get(f"{uapi}/LetsEncrypt/issue?{ssl_params}", timeout=180)
-          print(f"  LetsEncrypt ok={ok(r_ssl)} resp={json.dumps(parse(r_ssl))[:300]}")
-          if not ok(r_ssl):
-              # Correct function name is SSL/start_autossl_check (not *_cpanel_domains)
-              print("  Trying AutoSSL fallback...")
-              r_auto = curl_get(f"{uapi}/SSL/start_autossl_check")
-              print(f"  AutoSSL ok={ok(r_auto)} resp={json.dumps(parse(r_auto))[:300]}")
-
-          print("  Waiting 45s for cert provision...")
-          time.sleep(45)
-
-          # Re-enable Passenger with correct node path
-          print("  Re-enabling Passenger...")
-          r_file2 = curl_post(
-              f"{uapi}/Fileman/save_file_content",
-              {"dir": app_path, "file": ".htaccess", "content": htaccess}
-          )
-          print(f"  Restore .htaccess ok={ok(r_file2)}")
-          r_en2 = curl_get(f"{uapi}/PassengerApps/enable_application?name={app_name}")
-          print(f"  Re-enable ok={ok(r_en2)}")
-          print("  Waiting 20s for app restart...")
-          time.sleep(20)
-
-          # ── 8. Final checks + write status to a public file we can read ──
-          print("\n── Final checks ──")
-          time.sleep(10)
-          final_status = {}
-          for scheme in ('http', 'https'):
-              try:
-                  out = subprocess.check_output(
-                      ['curl', '-sk', '-i', '--max-time', '15',
-                       f'{scheme}://{domain}/text-to-leads'],
-                      text=True, timeout=20
-                  )
-                  first_line = out.split('\n')[0].strip()
-                  deny = next((l.strip() for l in out.split('\n') if 'deny-reason' in l.lower()), '')
-                  print(f"  {scheme}: {first_line} | {deny}")
-                  final_status[scheme] = first_line + (f" | {deny}" if deny else "")
-              except Exception as e:
-                  print(f"  {scheme} check: {e}")
-                  final_status[scheme] = f"ERROR: {e}"
-
-          # Save status to a public file in the FTP webroot so we can read it
-          # via HTTP (egress gateway may block tools.zulqurnainj.com directly but
-          # GitHub Pages on zulqurnainj.com is on the egress allowlist).
-          import datetime
-          status_text = (
-              f"Deploy time: {datetime.datetime.utcnow().isoformat()}Z\n"
-              f"HTTP:  {final_status.get('http', '?')}\n"
-              f"HTTPS: {final_status.get('https', '?')}\n"
-              f"nodejs_path: {nodejs_path}\n"
-              f"registered_node: {registered_node}\n"
-          )
-          print("\n── Status summary ──")
-          print(status_text)
-          PYEOF
-
-      - name: Publish deploy status to zulqurnainj.com repo
-        if: always()
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          # Re-check the actual HTTPS status from the GitHub runner (which has
-          # full network access) and commit it to zulqurnainj.com repo so the
-          # Claude sandbox (which may have egress restrictions) can read it.
-          python3 - << 'PYEOF'
-          import os, subprocess, json, base64, datetime, urllib.request, urllib.error
-          domain = "tools.zulqurnainj.com"
-          status = {}
-          for scheme in ('http', 'https'):
-              try:
-                  out = subprocess.check_output(
-                      ['curl', '-sk', '-i', '--max-time', '15',
-                       f'{scheme}://{domain}/text-to-leads'],
-                      text=True, timeout=20
-                  )
-                  first_line = out.split('\n')[0].strip()
-                  deny = next((l.strip() for l in out.split('\n') if 'deny-reason' in l.lower()), '')
-                  status[scheme] = first_line + (f" | {deny}" if deny else "")
-              except Exception as e:
-                  status[scheme] = f"ERROR: {e}"
-          content = (
-              "# Deploy status — tools.zulqurnainj.com/text-to-leads\n\n"
-              f"- Last deploy: {datetime.datetime.utcnow().isoformat()}Z\n"
-              f"- HTTP : `{status.get('http','?')}`\n"
-              f"- HTTPS: `{status.get('https','?')}`\n"
-              f"- Commit: `{os.environ.get('GITHUB_SHA','?')}`\n"
-              f"- Run:    https://github.com/Zulqurnain/text-to-leads-extractor/actions/runs/{os.environ.get('GITHUB_RUN_ID','?')}\n"
-          )
-          print(content)
-          token = os.environ.get('GH_PAT', '').strip()
-          if not token:
-              print("No GH_PAT set — skipping cross-repo status publish")
-              raise SystemExit(0)
-          api = "https://api.github.com/repos/Zulqurnain/zulqurnainj.com/contents/.deploy-status/tools.md"
-          headers = {
-              "Authorization": f"Bearer {token}",
-              "Accept": "application/vnd.github+json",
-              "User-Agent": "deploy-status-reporter",
-          }
-          # Get current SHA (if exists)
-          sha = None
-          try:
-              req = urllib.request.Request(api, headers=headers)
-              with urllib.request.urlopen(req, timeout=15) as r:
-                  sha = json.load(r).get('sha')
-          except urllib.error.HTTPError as e:
-              if e.code != 404:
-                  print(f"GET status file: {e.code}")
-          body = {
-              "message": f"deploy-status: tools.zulqurnainj.com http={status.get('http','?')[:60]}",
-              "content": base64.b64encode(content.encode()).decode(),
-              "branch": "master",
-          }
-          if sha:
-              body["sha"] = sha
-          req = urllib.request.Request(
-              api, data=json.dumps(body).encode(),
-              headers={**headers, "Content-Type": "application/json"},
-              method="PUT",
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=15) as r:
-                  print(f"Published status: HTTP {r.status}")
-          except urllib.error.HTTPError as e:
-              print(f"Publish failed: {e.code} {e.read().decode()[:400]}")
-          PYEOF
+          for i in 1 2 3 4 5; do
+            sleep 5
+            CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 "https://tools.zulqurnainj.com/text-to-leads" 2>/dev/null || true)
+            echo "attempt $i: HTTP $CODE"
+            [ "$CODE" = "200" ] && exit 0
+          done
+          ssh -i ~/.ssh/id_ed25519 "$U@$H" "curl -sI --max-time 10 http://127.0.0.1:3000/text-to-leads | head -3 && pm2 logs tools --lines 30 --nostream"
