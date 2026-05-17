@@ -3,135 +3,43 @@ name: Deploy to VPS
 on:
   push:
     branches: [master]
-    paths-ignore:
-      - '.diag/**'
-      - '.github/**-trigger.txt'
-      - 'README.md'
-  workflow_dispatch:
-
-concurrency:
-  group: deploy-tools
-  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      H:             ${{ secrets.VPS_HOST }}
-      U:             ${{ secrets.VPS_USER }}
-      DB_PASS:       ${{ secrets.DB_PASS }}
-      JWT_SECRET:    ${{ secrets.JWT_SECRET }}
-      LLAMA_API_URL: ${{ secrets.LLAMA_API_URL }}
-      LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
-      APP_DIR: /var/www/tools.zulqurnainj.com
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20'
           cache: 'npm'
 
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Build (standalone)
-        run: npm run build
+      - run: npm ci
+      - run: npm run build
 
       - name: Assemble standalone bundle
         run: |
           cp -r .next/static .next/standalone/.next/static
-          cp -r public      .next/standalone/public
-          mkdir -p .next/standalone/node_modules
-          for dep in offllama node-llama-cpp pdf-parse lifecycle-utils express commander @node-llama-cpp; do
-            if [ -d "node_modules/$dep" ]; then
-              cp -r "node_modules/$dep" .next/standalone/node_modules/
-            fi
-          done
+          cp -r public .next/standalone/public
 
-      - name: Write .env + startup.js + PM2 ecosystem
-        run: |
-          cat > .next/standalone/.env <<EOF
-          NEXT_PUBLIC_APP_URL=https://tools.zulqurnainj.com
-          DB_HOST=localhost
-          DB_USER=tools_user
-          DB_PASS=$DB_PASS
-          DB_NAME=tools_db
-          JWT_SECRET=$JWT_SECRET
-          CV_STORAGE_PATH=/var/cv_storage
-          OFFL_LLAMA_MODEL_DIR=/var/www/tools.zulqurnainj.com/models
-          ${LLAMA_API_URL:+LLAMA_API_URL=$LLAMA_API_URL}
-          ${LLAMA_API_KEY:+LLAMA_API_KEY=$LLAMA_API_KEY}
-          NODE_ENV=production
-          PORT=3000
-          HOSTNAME=127.0.0.1
-          EOF
+      - name: Rsync standalone to VPS
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -avz --delete --exclude='.env'
+          path: .next/standalone/
+          remote_path: /var/www/tools.zulqurnainj.com/
+          remote_host: ${{ secrets.VPS_HOST }}
+          remote_user: ${{ secrets.VPS_USER }}
+          remote_key: ${{ secrets.VPS_SSH_KEY }}
 
-          cat > .next/standalone/startup.js <<'EOF'
-          "use strict";
-          const fs = require("fs");
-          const path = require("path");
-          const envFile = path.join(__dirname, ".env");
-          if (fs.existsSync(envFile)) {
-            fs.readFileSync(envFile, "utf8").split("\n").forEach(line => {
-              const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-              if (m && m[1] && !(m[1] in process.env)) process.env[m[1]] = m[2];
-            });
-          }
-          require("./server.js");
-          EOF
-
-          cat > .next/standalone/ecosystem.config.js <<'EOF'
-          module.exports = {
-            apps: [{
-              name: "tools",
-              script: "./startup.js",
-              cwd: __dirname,
-              instances: 1,
-              exec_mode: "fork",
-              autorestart: true,
-              max_memory_restart: "1G",
-              env: { NODE_ENV: "production" }
-            }]
-          };
-          EOF
-
-      - name: Set up SSH key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "$H" >> ~/.ssh/known_hosts 2>/dev/null
-
-      - name: rsync bundle to VPS
-        run: |
-          rsync -az --delete --exclude='.env' \
-            -e "ssh -i ~/.ssh/id_ed25519" \
-            .next/standalone/ "$U@$H:$APP_DIR/"
-          scp -i ~/.ssh/id_ed25519 .next/standalone/.env "$U@$H:$APP_DIR/.env"
-
-      - name: Reload PM2
-        run: |
-          ssh -i ~/.ssh/id_ed25519 "$U@$H" "
-            cd $APP_DIR
-            chown -R www-data:www-data .
-            chmod 600 .env
-            if pm2 describe tools >/dev/null 2>&1; then
-              pm2 reload tools --update-env
-            else
-              pm2 start ecosystem.config.js
-              pm2 save
-            fi
-            pm2 list
-          "
-
-      - name: Smoke test
-        run: |
-          for i in 1 2 3 4 5; do
-            sleep 5
-            CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 "https://tools.zulqurnainj.com/text-to-leads" 2>/dev/null || true)
-            echo "attempt $i: HTTP $CODE"
-            [ "$CODE" = "200" ] && exit 0
-          done
-          ssh -i ~/.ssh/id_ed25519 "$U@$H" "curl -sI --max-time 10 http://127.0.0.1:3000/text-to-leads | head -3 && pm2 logs tools --lines 30 --nostream"
+      - name: Restart PM2 on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /var/www/tools.zulqurnainj.com
+            pm2 restart tools || pm2 start server.js --name tools
+            echo "Deployed at $(date)"
