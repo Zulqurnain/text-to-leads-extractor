@@ -52,6 +52,15 @@ export default function TextToLeadsPage() {
         <p className="text-xs text-olive-400 text-center">
           Built with self-hosted AI — your data stays private.
         </p>
+
+        <div className="flex justify-center gap-4 text-xs text-olive-400">
+          <a href="/llms.txt" className="hover:text-olive-600 transition-colors underline underline-offset-2">
+            llms.txt
+          </a>
+          <a href="https://zulqurnainj.com" target="_blank" rel="noopener noreferrer" className="hover:text-olive-600 transition-colors">
+            zulqurnainj.com
+          </a>
+        </div>
       </div>
     </main>
   );

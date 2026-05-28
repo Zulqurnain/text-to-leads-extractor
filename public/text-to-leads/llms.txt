@@ -1,0 +1,27 @@
+# Text To Leads Extractor
+
+## What it does
+Paste any job post, LinkedIn message, or outreach text. AI extracts recruiter emails, WhatsApp numbers, and Telegram handles — then generates a personalised outreach message with your CV attached, sent in one click.
+
+## Features
+- Connect Gmail, Outlook, or Yahoo — sends from your own email address via SMTP
+- AI extracts emails, phone numbers, and Telegram usernames from any pasted text
+- Automatically generates a personalised email with your name, skills, and experience
+- Attaches your uploaded CV to every outreach email
+- One-click WhatsApp and Telegram links with pre-filled message
+- Upload your CV once — reused for every outreach session
+- Fully self-hosted AI — your data never leaves the server
+
+## How to use
+1. Sign up at https://tools.zulqurnainj.com/auth/signup
+2. Connect your email account (Gmail, Outlook, Yahoo) via SMTP settings
+3. Upload your CV in the dashboard
+4. Paste any job post or recruiter message into the text box
+5. Click Extract — AI pulls all contact details
+6. Send personalised email or open WhatsApp/Telegram with pre-filled message
+
+## URL
+https://tools.zulqurnainj.com/text-to-leads
+
+## Author
+Zulqurnain Haider — https://zulqurnainj.com
