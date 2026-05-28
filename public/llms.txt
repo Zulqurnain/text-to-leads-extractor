@@ -1,0 +1,41 @@
+# tools.zulqurnainj.com — SaaS Tools by Zulqurnain Haider
+
+## What this subdomain is
+A collection of self-hosted SaaS tools built by Zulqurnain Haider. All tools run on private infrastructure — your data stays private.
+
+## Tools available
+
+### Text To Leads Extractor
+URL: https://tools.zulqurnainj.com/text-to-leads
+Paste any job post, LinkedIn message, or outreach text. AI extracts recruiter emails, WhatsApp numbers, and Telegram handles — then generates a personalised message with your CV attached, sent in one click.
+- Connects Gmail, Outlook, or Yahoo (send from your own address)
+- AI contact extraction from raw text
+- Auto-generated personalised email with CV attached
+- One-click WhatsApp and Telegram links
+- CV upload, stored and reused for every outreach
+- Built with self-hosted AI (privacy-first)
+
+### Prompt Health Checker
+URL: https://tools.zulqurnainj.com/prompt-health-checker
+Analyse and score your AI prompts for clarity, specificity, and effectiveness before sending them to any LLM. Get actionable improvement suggestions.
+
+### NotePackz
+URL: https://tools.zulqurnainj.com/notepackz
+A minimal, privacy-first notepad with rich-text editing, public shareable links, and cloud sync.
+- Rich-text editor (TipTap)
+- Guest notes with no sign-up required
+- Shareable public links and embed support
+- ASCII table and Unicode tools
+- Plans: Free (5 links), Pro, Lifetime
+
+## Author
+Zulqurnain Haider — https://zulqurnainj.com
+Email: me@zulqurnainj.com
+
+## Sitemap
+https://tools.zulqurnainj.com/sitemap.xml
+
+## Per-tool AI context
+- Text To Leads: https://tools.zulqurnainj.com/text-to-leads/llms.txt
+- Prompt Health Checker: https://tools.zulqurnainj.com/prompt-health-checker/llms.txt
+- NotePackz: https://tools.zulqurnainj.com/notepackz/llms.txt
