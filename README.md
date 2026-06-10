@@ -2,8 +2,6 @@
 
 AI-powered outreach tool. Paste any job post or recruiter message — AI extracts contacts (email, WhatsApp, Telegram) and writes a personalised outreach email with your CV attached. Send in one click.
 
-**Live at:** [tools.zulqurnainj.com/text-to-leads](https://tools.zulqurnainj.com/text-to-leads)
-
 ---
 
 ## Features
@@ -39,7 +37,7 @@ AI-powered outreach tool. Paste any job post or recruiter message — AI extract
 ```
 src/
   app/
-    text-to-leads/page.tsx   ← Landing page (tools.zulqurnainj.com/text-to-leads)
+    text-to-leads/page.tsx   ← Landing page
     dashboard/page.tsx       ← Main tool UI
     auth/login/page.tsx
     auth/signup/page.tsx
@@ -126,4 +124,4 @@ npm run dev
 
 ## License
 
-Private — all rights reserved. Built by [Zulqurnain Haider](https://zulqurnainj.com).
+MIT — open source, free to use and deploy.

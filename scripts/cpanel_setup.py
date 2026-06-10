@@ -42,8 +42,8 @@ print(r[:200])
 print("\n=== Registering Passenger Node.js App ===")
 app_params = urllib.parse.urlencode({
     "name": "tools",
-    "path": f"/home/{user}/tools.zulqurnainj.com",
-    "domain": "tools.zulqurnainj.com",
+    "path": f"/home/{user}/your-domain.com",
+    "domain": "your-domain.com",
     "base_uri": "/",
     "startup_file": "startup.js",
     "app_type": "node",
