@@ -57,8 +57,8 @@ export default function TextToLeadsPage() {
           <a href="/llms.txt" className="hover:text-olive-600 transition-colors underline underline-offset-2">
             llms.txt
           </a>
-          <a href="https://zulqurnainj.com" target="_blank" rel="noopener noreferrer" className="hover:text-olive-600 transition-colors">
-            zulqurnainj.com
+          <a href="https://github.com/Zulqurnain/text-to-leads-extractor" target="_blank" rel="noopener noreferrer" className="hover:text-olive-600 transition-colors">
+            GitHub
           </a>
         </div>
       </div>
