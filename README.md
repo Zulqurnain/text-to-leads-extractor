@@ -125,3 +125,7 @@ npm run dev
 ## License
 
 MIT — open source, free to use and deploy.
+
+## Recent changes
+
+- 2026-10-20: Commit history tidied up: every commit is now credited to Zulqurnain.
